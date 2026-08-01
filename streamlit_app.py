@@ -206,8 +206,9 @@ with tab_ts:
 
     # ---- snapshot explorer ----
     st.markdown("#### Snapshot explorer")
-    st.caption("Pick a time to inspect the radial profile + Gaussian fit (pinhole shaded) "
-               "and the collected emission spectrum with its Planck fit.")
+    st.caption("Pick a time to inspect the radial profile + Gaussian fit (pinhole shaded), and "
+               "the **numerically-collected** spectrum (black) with its **best-fit single "
+               "Planck** (red). Green dotted = analytic Gaussian-surrogate spectrum.")
     j = st.slider("snapshot", 0, n_t-1, jpk, key="ts_snap",
                   help="index into the time series")
     st.write(f"**{tlabel} = {t[j]:g}**")
@@ -262,8 +263,9 @@ with tab_prof:
         fig.tight_layout(rect=(0, 0, 1, 0.94))
         st.pyplot(fig, use_container_width=True)
         st.caption("Left: data (black), Gaussian fitted inside the pinhole (green), pinhole "
-                   "shaded blue. Right: collected spectrum (black), its Planck fit (red), and "
-                   "the Gaussian universal prediction (green).")
+                   "shaded blue. Right: **collected spectrum** = numerical integral of the "
+                   "data $T(r)$ (black); **best-fit single Planck** at $T_{app}$ (red); the "
+                   "analytic Gaussian-surrogate spectrum (green, dotted).")
 
 
 # ============================================================ TAB 3: GAUSSIAN & UNIVERSAL

@@ -58,12 +58,12 @@ def plot_profile_eval(fig, res, fit_lo, fit_hi):
     # right: collected spectrum (linear) + apparent-T fit + Gaussian universal prediction
     F, lam = res["F_full"], res["lam_full"]
     norm = F.max()
-    ax1.plot(lam*1e6, F/norm, 'k-', lw=2, label="collected (simulated)")
+    ax1.plot(lam*1e6, F/norm, 'k-', lw=2, label="collected spectrum (numerical, from data $T(r)$)")
     ax1.plot(lam*1e6, planck(lam, res["T_app"], res["A_app"])/norm, 'r--', lw=1.6,
-             label=f"Planck fit {res['T_app']:.0f} K")
+             label=f"best-fit single Planck ($T_{{\\rm app}}$={res['T_app']:.0f} K)")
     if g:
         ax1.plot(lam*1e6, g["F_full"]/norm, color="seagreen", ls=":", lw=1.8,
-                 label=f"Gaussian universal ({g['T_app']:.0f} K)")
+                 label="Gaussian-surrogate spectrum (analytic / closed form)")
     ax1.axvspan(fit_lo*1e6, fit_hi*1e6, color="orange", alpha=.2, label="fit window")
     ax1.set_xlim(0, 3)
     ax1.set_xlabel(r"$\lambda$ ($\mu$m)"); ax1.set_ylabel(r"$F/F_{\max}$ (linear)")
