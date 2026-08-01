@@ -211,7 +211,7 @@ def run_config(cfg):
                 T0_rec=T0_rec, rec_err=T0_rec - T0)
 
 # ----------------------------------------------------------------- ARBITRARY (SIMULATED) PROFILE
-_trapz = getattr(np, "trapezoid", np.trapz)   # np.trapz renamed in NumPy 2.0
+_trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz  # np.trapz removed in NumPy 2.x
 
 def spectrum_from_profile(lam, r, T_r, R=None, eps=1.0):
     """Collected spectrum for a TABULATED radial profile T(r) (e.g. from a hydrocode).

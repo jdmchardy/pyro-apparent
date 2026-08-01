@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# rebuilt on first use (window-specific), ~3 s
+ratio_table_*.npz
