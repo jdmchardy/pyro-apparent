@@ -76,6 +76,17 @@ def _eval_snapshot(file_bytes, name, j, R, lo, hi):
     return evaluate_profile(r, T[:, j], lo, hi, R=R)
 
 
+def gauss_apparent(res, lam_lo, lam_hi):
+    """Apparent T under the Gaussian assumption, via the lookup table:
+    T0_fit * rho(R/sigma, xi).  Returns None if no Gaussian fit is available."""
+    g = res.get("gauss")
+    if not g:
+        return None
+    tab = get_ratio_table(lam_lo, lam_hi)
+    xi_g = float(xi_window(g["T0"], lam_lo, lam_hi))
+    return float(g["T0"] * ratio_from_table(tab, g["R_over_sigma"], xi_g))
+
+
 def data_source(default_path, label, key):
     """File uploader with a bundled-sample fallback; returns (bytes, name)."""
     up = st.file_uploader(label, type=["csv", "txt", "dat"], key=key)
@@ -137,28 +148,38 @@ with tab_ts:
     n_t = T_cols.shape[1]
     with st.spinner("evaluating series…"):
         s = _eval_series(fbytes, fname, R, method, lo, hi)
+        s_num = s if method == "numerical" else _eval_series(fbytes, fname, R, "numerical", lo, hi)
 
-    # ---- headline metrics ----
-    jpk = int(np.nanargmax(s["T_peak"]))
+    # ---- headline metrics (bias/apparent are always the true numerical fit) ----
+    jpk = int(np.nanargmax(s_num["T_peak"]))
+    bias_num = (s_num["T_app"]/s_num["T_peak"] - 1)*100
+    approx_gap = float(np.nanmax(np.abs(s["T_app"] - s_num["T_app"])))
     m = st.columns(5)
     m[0].metric("snapshots", f"{n_t}")
-    m[1].metric("max peak T", f"{np.nanmax(s['T_peak']):.0f} K")
-    m[2].metric("apparent T at peak", f"{s['T_app'][jpk]:.0f} K",
-                f"{s['T_app'][jpk]-s['T_peak'][jpk]:+.0f} K vs true")
-    m[3].metric("max bias", f"{np.nanmin(s['T_app']/s['T_peak']-1)*100:+.1f} %")
-    m[4].metric("edge T at peak", f"{s['T_edge'][jpk]:.0f} K")
+    m[1].metric("max peak T", f"{np.nanmax(s_num['T_peak']):.0f} K")
+    m[2].metric("apparent T @ hottest (numerical)", f"{s_num['T_app'][jpk]:.0f} K")
+    m[3].metric("max bias (numerical)", f"{np.nanmin(bias_num):+.1f} %",
+                help="apparent (numerical) vs true peak")
+    if method != "numerical":
+        m[4].metric("max Gaussian error", f"{approx_gap:.0f} K",
+                    help=f"max |{METHOD_LABEL[method]} − numerical| apparent-T over the run")
+    else:
+        m[4].metric("edge T @ hottest", f"{s_num['T_edge'][jpk]:.0f} K")
 
     # ---- main history plot ----
     st.markdown("#### Temperature history through the pinhole")
     fig, ax = plt.subplots(figsize=(11, 4.4))
-    t = s["times"]
-    ax.fill_between(t, s["T_app"], s["T_peak"], color="crimson", alpha=.08,
-                    label="measurement bias")
-    ax.plot(t, s["T_peak"], "-o", color="k", ms=3, lw=1.9, label="actual peak $T$ (data)")
-    ax.plot(t, s["T_gauss"], "--", color="seagreen", lw=1.9, label="fitted Gaussian peak $T_0$")
-    ax.plot(t, s["T_app"], "-", color="crimson", lw=1.9,
-            label=f"apparent $T$ ({METHOD_LABEL[method]})")
-    ax.plot(t, s["T_edge"], ":", color="steelblue", lw=2.2,
+    t = s_num["times"]
+    ax.fill_between(t, s_num["T_app"], s_num["T_peak"], color="crimson", alpha=.07,
+                    label="measurement bias (numerical)")
+    ax.plot(t, s_num["T_peak"], "-o", color="k", ms=3, lw=1.9, label="actual peak $T$ (data)")
+    ax.plot(t, s_num["T_gauss"], "--", color="seagreen", lw=1.6, label="fitted Gaussian peak $T_0$")
+    ax.plot(t, s_num["T_app"], "-", color="crimson", lw=2.0,
+            label="apparent $T$ (numerical, true fit)")
+    if method != "numerical":
+        ax.plot(t, s["T_app"], "-.", color="darkorange", lw=1.8,
+                label=f"apparent $T$ (Gaussian, {METHOD_LABEL[method]})")
+    ax.plot(t, s_num["T_edge"], ":", color="steelblue", lw=2.2,
             label=f"$T$ at pinhole edge (R={R_um:g} µm)")
     ax.set_xlabel(tlabel); ax.set_ylabel("temperature (K)")
     ax.legend(ncol=2, fontsize=9); ax.grid(alpha=.25)
@@ -195,12 +216,13 @@ with tab_ts:
     # ---- geometry / bias evolution ----
     st.markdown("#### Fit geometry and bias over time")
     fig, ax = plt.subplots(figsize=(11, 3.2))
-    ax.plot(t, R / s["sigma"], color="purple", lw=1.8, label=r"$R/\sigma$ (fit)")
+    ax.plot(t, R / s_num["sigma"], color="purple", lw=1.8, label=r"$R/\sigma$ (fit)")
     ax.set_xlabel(tlabel); ax.set_ylabel(r"$R/\sigma$", color="purple")
     ax.tick_params(axis="y", labelcolor="purple"); ax.grid(alpha=.25)
     ax2 = ax.twinx()
-    ax2.plot(t, (s["T_app"]/s["T_peak"]-1)*100, color="crimson", lw=1.8, label="bias (%)")
-    ax2.set_ylabel("apparent-$T$ bias (%)", color="crimson")
+    ax2.plot(t, (s_num["T_app"]/s_num["T_peak"]-1)*100, color="crimson", lw=1.8,
+             label="bias (%)")
+    ax2.set_ylabel("apparent-$T$ bias (numerical, %)", color="crimson")
     ax2.tick_params(axis="y", labelcolor="crimson")
     st.pyplot(fig, use_container_width=True)
 
@@ -213,22 +235,28 @@ with tab_ts:
                   help="index into the time series")
     st.write(f"**{tlabel} = {t[j]:g}**")
     res = _eval_snapshot(fbytes, fname, j, R, lo, hi)
+    t_app_tab = gauss_apparent(res, lo, hi)          # Gaussian-assumption apparent T (table)
     fig = plt.figure(figsize=(11, 4.3))
-    plot_profile_eval(fig, res, lo, hi)
+    plot_profile_eval(fig, res, lo, hi, t_app_gauss=t_app_tab)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     st.pyplot(fig, use_container_width=True)
     g = res.get("gauss") or {}
     sm = st.columns(5)
     sm[0].metric("actual peak", f"{res['T_peak']:.0f} K")
-    sm[1].metric("Gaussian peak", f"{g.get('T0', float('nan')):.0f} K")
-    sm[2].metric("apparent T", f"{res['T_app']:.0f} K")
+    sm[1].metric("apparent (numerical)", f"{res['T_app']:.0f} K")
+    if t_app_tab is not None:
+        sm[2].metric("apparent (Gaussian/table)", f"{t_app_tab:.0f} K",
+                     f"{t_app_tab - res['T_app']:+.0f} K vs numerical")
+    else:
+        sm[2].metric("apparent (Gaussian/table)", "—")
     sm[3].metric("edge T(R)", f"{float(np.interp(R, r, T_cols[:, j])):.0f} K")
     sm[4].metric("R/σ, ξ", f"{g.get('R_over_sigma', float('nan')):.2f}, {res['xi']:.2f}")
 
     # ---- download ----
-    out = np.column_stack([t, s["T_peak"], s["T_gauss"], s["T_app"], s["T_edge"],
-                           s["sigma"]*1e6])
-    csv = "time,T_peak_K,T_gauss_K,T_app_K,T_edge_K,sigma_um\n" + "\n".join(
+    out = np.column_stack([t, s_num["T_peak"], s_num["T_gauss"], s_num["T_app"],
+                           s["T_app"], s_num["T_edge"], s_num["sigma"]*1e6])
+    header = f"time,T_peak_K,T_gauss_K,T_app_numerical_K,T_app_{method}_K,T_edge_K,sigma_um"
+    csv = header + "\n" + "\n".join(
         ",".join(f"{v:.6g}" for v in row) for row in out)
     st.download_button("⬇ download history (CSV)", csv, "temperature_history.csv",
                        "text/csv")
@@ -259,7 +287,7 @@ with tab_prof:
                      f"{g.get('recover_err', float('nan')):+.0f} K vs peak")
         mm[4].metric("ξ", f"{res['xi']:.2f}")
         fig = plt.figure(figsize=(11, 4.3))
-        plot_profile_eval(fig, res, lo, hi)
+        plot_profile_eval(fig, res, lo, hi, t_app_gauss=gauss_apparent(res, lo, hi))
         fig.tight_layout(rect=(0, 0, 1, 0.94))
         st.pyplot(fig, use_container_width=True)
         st.caption("Left: data (black), Gaussian fitted inside the pinhole (green), pinhole "

@@ -31,7 +31,7 @@ def plot_time_series(fig, s, time_label="time"):
     ax.legend(fontsize=8.5); ax.grid(alpha=.25)
 
 
-def plot_profile_eval(fig, res, fit_lo, fit_hi):
+def plot_profile_eval(fig, res, fit_lo, fit_hi, t_app_gauss=None):
     """Two-panel view for a simulated T(r): the profile, and its collected spectrum
     with the single-Planck apparent-T fit overlaid. `res` is from evaluate_profile()."""
     ax0, ax1 = fig.subplots(1, 2)
@@ -50,7 +50,10 @@ def plot_profile_eval(fig, res, fit_lo, fit_hi):
     ax0.axhline(res["T_peak"], color="grey", ls=":", lw=1,
                 label=f"peak {res['T_peak']:.0f} K")
     ax0.axhline(res["T_app"], color="crimson", ls="--", lw=1.4,
-                label=f"apparent {res['T_app']:.0f} K")
+                label=f"apparent, numerical {res['T_app']:.0f} K")
+    if t_app_gauss is not None:
+        ax0.axhline(t_app_gauss, color="darkorange", ls="-.", lw=1.4,
+                    label=f"apparent, Gaussian/table {t_app_gauss:.0f} K")
     ax0.set_xlabel(r"$r$ ($\mu$m)"); ax0.set_ylabel(r"$T(r)$ (K)")
     ax0.set_title("Simulated radial temperature profile")
     ax0.legend(fontsize=7.5); ax0.grid(alpha=.25)
