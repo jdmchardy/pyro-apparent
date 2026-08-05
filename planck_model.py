@@ -354,6 +354,7 @@ def load_profile_series(path):
                     nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
                     if nums:
                         times = np.array([float(x) for x in nums], float)
+                        break   # first times line wins; ignore later comments
                 continue
             break
     data = None
@@ -374,6 +375,59 @@ def load_profile_series(path):
     if times is None or len(times) != n_t:
         times = np.arange(n_t, dtype=float)
     return times, r, T_cols
+
+def parse_comsol_line_graph(path, t_end=None, times=None):
+    """Parse a COMSOL 1-D 'Line graph' export into (times, r[m], T[n_r, n_t]).
+
+    The file has radius rows (column 0 = R in metres) and one temperature column per
+    time. Times are read from the column headers if they carry '@ t=' / 't=' / 'Time='
+    labels; otherwise from `times`, else 0..t_end in equal steps, else 0..n_t-1.
+    """
+    desc = None
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("%"):
+                if "Temperature" in line:
+                    desc = line            # the R / Temperature column-descriptor line
+            else:
+                break
+    data = np.atleast_2d(np.loadtxt(path, comments="%"))
+    if data.shape[1] < 2:
+        raise ValueError("expected >= 2 columns (R + temperature snapshots)")
+    r = data[:, 0].astype(float)
+    T_cols = data[:, 1:].astype(float)
+    n_t = T_cols.shape[1]
+    t = None
+    if desc is not None:                    # try to read times from the header labels
+        found = re.findall(r"(?:@\s*)?(?:time|t)\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)",
+                           desc, re.I)
+        if len(found) != n_t:
+            found = re.findall(r"@\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", desc)
+        if len(found) == n_t:
+            t = np.array([float(x) for x in found], float)
+    if t is None:
+        if times is not None:
+            t = np.asarray(times, float)
+        elif t_end is not None:
+            t = np.linspace(0.0, float(t_end), n_t)
+        else:
+            t = np.arange(n_t, dtype=float)
+    if t.size != n_t:
+        raise ValueError(f"number of times ({t.size}) != temperature columns ({n_t})")
+    order = np.argsort(r)
+    return t, r[order], T_cols[order]
+
+def write_series_csv(path, times, r, T_cols, note=""):
+    """Write (times, r[m], T[n_r, n_t]) as the app's wide CSV: radius_um then T columns,
+    with the times in a '# times = ...' comment header (whatever unit `times` is in)."""
+    times = np.asarray(times, float); r = np.asarray(r, float); T_cols = np.asarray(T_cols, float)
+    if T_cols.shape != (r.size, times.size):
+        raise ValueError("T_cols must have shape (len(r), len(times))")
+    hdr = "times = " + " ".join(f"{x:g}" for x in times)
+    if note:
+        hdr += "\n" + note
+    np.savetxt(path, np.column_stack([r*1e6, T_cols]),
+               delimiter=",", header=hdr, comments="# ", fmt="%.6g")
 
 def evaluate_profile_series(times, r, T_cols, lam_lo, lam_hi, R=None, method="table"):
     """Reduce a time series of profiles to temperature histories.

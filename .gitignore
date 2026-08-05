@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 # rebuilt on first use (window-specific), ~3 s
 ratio_table_*.npz
+# local COMSOL test exports (not part of the app)
+test_data_Nicolas/

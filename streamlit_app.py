@@ -26,6 +26,7 @@ from planck_model import (spectrum, spectrum_from_profile, planck, fit_temperatu
                           correct_temperature, run_config,
                           load_profile, evaluate_profile,
                           load_profile_series, evaluate_profile_series,
+                          parse_comsol_line_graph,
                           get_ratio_table, ratio_from_table, C2)
 from planck_plots import plot_comparison, plot_profile_eval
 
@@ -65,14 +66,34 @@ def _load_single(file_bytes, name):
         os.unlink(path)
     return r, T
 
+def _is_comsol(file_bytes):
+    head = file_bytes[:400].decode("utf-8", "ignore")
+    return "COMSOL" in head or head.lstrip().startswith("% Model")
+
 @st.cache_data(show_spinner=False)
-def _eval_series(file_bytes, name, R, method, lo, hi):
-    times, r, T = _load_series(file_bytes, name)
+def _series_arrays(file_bytes, name, t_end_us):
+    """Load a series from either the app CSV format or a COMSOL line-graph export.
+    Returns (times [file units, µs for COMSOL], r [m], T [n_r, n_t])."""
+    if _is_comsol(file_bytes):
+        suffix = os.path.splitext(name)[1] or ".txt"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(file_bytes); path = f.name
+        try:
+            t_end = (t_end_us * 1e-6) if t_end_us else None
+            t, r, T = parse_comsol_line_graph(path, t_end=t_end)
+        finally:
+            os.unlink(path)
+        return t * 1e6, r, T            # times in µs
+    return _load_series(file_bytes, name)
+
+@st.cache_data(show_spinner=False)
+def _eval_series(file_bytes, name, R, method, lo, hi, t_end_us):
+    times, r, T = _series_arrays(file_bytes, name, t_end_us)
     return evaluate_profile_series(times, r, T, lo, hi, R=R, method=method)
 
 @st.cache_data(show_spinner=False)
-def _eval_snapshot(file_bytes, name, j, R, lo, hi):
-    _, r, T = _load_series(file_bytes, name)
+def _eval_snapshot(file_bytes, name, j, R, lo, hi, t_end_us):
+    _, r, T = _series_arrays(file_bytes, name, t_end_us)
     return evaluate_profile(r, T[:, j], lo, hi, R=R)
 
 
@@ -124,13 +145,14 @@ tab_ts, tab_prof, tab_uni, tab_batch, tab_about = st.tabs(
 with tab_ts:
     st.subheader("Time series of radial temperature profiles")
     st.markdown(
-        "Upload a **wide CSV**: column 0 = radius [µm], each further column = $T$ [K] at "
-        "one time. Put the times in a comment line, e.g. `# times = 0 2.5 5 ...`.")
+        "Upload the app **wide CSV** (column 0 = radius [µm]; further columns = $T$ [K] per "
+        "time; times in a `# times = …` comment) **or a COMSOL 1-D line-graph export** — "
+        "COMSOL files are converted automatically.")
 
     c0, c1, c2, c3 = st.columns([2, 1, 1, 1])
     with c0:
         fbytes, fname = data_source(os.path.join(HERE, "sample_Tseries_diffusion.csv"),
-                                    "Upload time-series CSV", key="ts")
+                                    "Upload time-series CSV or COMSOL .txt", key="ts")
     with c1:
         R_um = st.number_input("pinhole R [µm]", 0.5, 500.0, 25.0, step=1.0, key="ts_R")
     with c2:
@@ -143,12 +165,24 @@ with tab_ts:
 
     if fbytes is None:
         st.stop()
+
+    # COMSOL line-graph files carry no times -> assume 0..T_end in equal steps
+    is_comsol = _is_comsol(fbytes)
+    t_end_us = 0.0
+    if is_comsol:
+        cc0, cc1 = st.columns([1, 3])
+        t_end_us = cc0.number_input("COMSOL T_end [µs]", 0.001, 1e6, 37.0, step=1.0,
+                                    key="ts_tend")
+        cc1.info("COMSOL line-graph detected — times aren't in the file, so they're set to "
+                 "0 → T_end in equal steps. Set T_end (µs) for this run; replace with a "
+                 "time-labelled export later and it will be read automatically.")
+
     R = R_um * 1e-6
-    times, r, T_cols = _load_series(fbytes, fname)
+    times, r, T_cols = _series_arrays(fbytes, fname, t_end_us)
     n_t = T_cols.shape[1]
     with st.spinner("evaluating series…"):
-        s = _eval_series(fbytes, fname, R, method, lo, hi)
-        s_num = s if method == "numerical" else _eval_series(fbytes, fname, R, "numerical", lo, hi)
+        s = _eval_series(fbytes, fname, R, method, lo, hi, t_end_us)
+        s_num = s if method == "numerical" else _eval_series(fbytes, fname, R, "numerical", lo, hi, t_end_us)
 
     # ---- headline metrics (bias/apparent are always the true numerical fit) ----
     jpk = int(np.nanargmax(s_num["T_peak"]))
@@ -234,7 +268,7 @@ with tab_ts:
     j = st.slider("snapshot", 0, n_t-1, jpk, key="ts_snap",
                   help="index into the time series")
     st.write(f"**{tlabel} = {t[j]:g}**")
-    res = _eval_snapshot(fbytes, fname, j, R, lo, hi)
+    res = _eval_snapshot(fbytes, fname, j, R, lo, hi, t_end_us)
     t_app_tab = gauss_apparent(res, lo, hi)          # Gaussian-assumption apparent T (table)
     fig = plt.figure(figsize=(11, 4.3))
     plot_profile_eval(fig, res, lo, hi, t_app_gauss=t_app_tab)
@@ -258,8 +292,18 @@ with tab_ts:
     header = f"time,T_peak_K,T_gauss_K,T_app_numerical_K,T_app_{method}_K,T_edge_K,sigma_um"
     csv = header + "\n" + "\n".join(
         ",".join(f"{v:.6g}" for v in row) for row in out)
-    st.download_button("⬇ download history (CSV)", csv, "temperature_history.csv",
-                       "text/csv")
+    dl0, dl1 = st.columns(2)
+    dl0.download_button("⬇ download history (CSV)", csv, "temperature_history.csv",
+                        "text/csv")
+    if is_comsol:
+        conv_hdr = ("# times = " + " ".join(f"{x:g}" for x in times) +
+                    "\n# radius_um, T[K] per time (µs); converted from COMSOL line graph")
+        prof = np.column_stack([r*1e6, T_cols])
+        conv = conv_hdr + "\n" + "\n".join(
+            ",".join(f"{v:.6g}" for v in row) for row in prof)
+        dl1.download_button("⬇ download converted app CSV", conv,
+                            "converted_series.csv", "text/csv",
+                            help="the COMSOL profiles in the app's reusable CSV format")
 
 
 # ============================================================ TAB 2: SINGLE PROFILE
