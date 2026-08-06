@@ -376,12 +376,12 @@ def load_profile_series(path):
         times = np.arange(n_t, dtype=float)
     return times, r, T_cols
 
-def parse_comsol_line_graph(path, t_end=None, times=None):
+def parse_comsol_line_graph(path, dt=None, times=None):
     """Parse a COMSOL 1-D 'Line graph' export into (times, r[m], T[n_r, n_t]).
 
     The file has radius rows (column 0 = R in metres) and one temperature column per
     time. Times are read from the column headers if they carry '@ t=' / 't=' / 'Time='
-    labels; otherwise from `times`, else 0..t_end in equal steps, else 0..n_t-1.
+    labels; otherwise from `times`, else uniform steps of `dt` from 0, else 0..n_t-1.
     """
     desc = None
     with open(path) as fh:
@@ -408,8 +408,8 @@ def parse_comsol_line_graph(path, t_end=None, times=None):
     if t is None:
         if times is not None:
             t = np.asarray(times, float)
-        elif t_end is not None:
-            t = np.linspace(0.0, float(t_end), n_t)
+        elif dt is not None:
+            t = np.arange(n_t, dtype=float) * float(dt)
         else:
             t = np.arange(n_t, dtype=float)
     if t.size != n_t:

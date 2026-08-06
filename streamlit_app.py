@@ -71,29 +71,30 @@ def _is_comsol(file_bytes):
     return "COMSOL" in head or head.lstrip().startswith("% Model")
 
 @st.cache_data(show_spinner=False)
-def _series_arrays(file_bytes, name, t_end_us):
+def _series_arrays(file_bytes, name, dt_us):
     """Load a series from either the app CSV format or a COMSOL line-graph export.
-    Returns (times [file units, µs for COMSOL], r [m], T [n_r, n_t])."""
+    Returns (times [file units, µs for COMSOL], r [m], T [n_r, n_t]).
+    For COMSOL files without embedded times, dt_us is the fixed step between snapshots."""
     if _is_comsol(file_bytes):
         suffix = os.path.splitext(name)[1] or ".txt"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(file_bytes); path = f.name
         try:
-            t_end = (t_end_us * 1e-6) if t_end_us else None
-            t, r, T = parse_comsol_line_graph(path, t_end=t_end)
+            dt = (dt_us * 1e-6) if dt_us else None
+            t, r, T = parse_comsol_line_graph(path, dt=dt)
         finally:
             os.unlink(path)
         return t * 1e6, r, T            # times in µs
     return _load_series(file_bytes, name)
 
 @st.cache_data(show_spinner=False)
-def _eval_series(file_bytes, name, R, method, lo, hi, t_end_us):
-    times, r, T = _series_arrays(file_bytes, name, t_end_us)
+def _eval_series(file_bytes, name, R, method, lo, hi, dt_us):
+    times, r, T = _series_arrays(file_bytes, name, dt_us)
     return evaluate_profile_series(times, r, T, lo, hi, R=R, method=method)
 
 @st.cache_data(show_spinner=False)
-def _eval_snapshot(file_bytes, name, j, R, lo, hi, t_end_us):
-    _, r, T = _series_arrays(file_bytes, name, t_end_us)
+def _eval_snapshot(file_bytes, name, j, R, lo, hi, dt_us):
+    _, r, T = _series_arrays(file_bytes, name, dt_us)
     return evaluate_profile(r, T[:, j], lo, hi, R=R)
 
 
@@ -166,23 +167,23 @@ with tab_ts:
     if fbytes is None:
         st.stop()
 
-    # COMSOL line-graph files carry no times -> assume 0..T_end in equal steps
+    # COMSOL line-graph files carry no times -> snapshots at a fixed interval dt
     is_comsol = _is_comsol(fbytes)
-    t_end_us = 0.0
+    dt_us = 0.0
     if is_comsol:
         cc0, cc1 = st.columns([1, 3])
-        t_end_us = cc0.number_input("COMSOL T_end [µs]", 0.001, 1e6, 37.0, step=1.0,
-                                    key="ts_tend")
+        dt_us = cc0.number_input("COMSOL Δt between steps [µs]", 1e-4, 1e4, 0.1,
+                                 step=0.1, format="%.4f", key="ts_dt")
         cc1.info("COMSOL line-graph detected — times aren't in the file, so they're set to "
-                 "0 → T_end in equal steps. Set T_end (µs) for this run; replace with a "
-                 "time-labelled export later and it will be read automatically.")
+                 "0, Δt, 2Δt, … from the fixed sampling interval. Set Δt (µs) for this run; "
+                 "replace with a time-labelled export later and it will be read automatically.")
 
     R = R_um * 1e-6
-    times, r, T_cols = _series_arrays(fbytes, fname, t_end_us)
+    times, r, T_cols = _series_arrays(fbytes, fname, dt_us)
     n_t = T_cols.shape[1]
     with st.spinner("evaluating series…"):
-        s = _eval_series(fbytes, fname, R, method, lo, hi, t_end_us)
-        s_num = s if method == "numerical" else _eval_series(fbytes, fname, R, "numerical", lo, hi, t_end_us)
+        s = _eval_series(fbytes, fname, R, method, lo, hi, dt_us)
+        s_num = s if method == "numerical" else _eval_series(fbytes, fname, R, "numerical", lo, hi, dt_us)
 
     # ---- headline metrics (bias/apparent are always the true numerical fit) ----
     jpk = int(np.nanargmax(s_num["T_peak"]))
@@ -268,7 +269,7 @@ with tab_ts:
     j = st.slider("snapshot", 0, n_t-1, jpk, key="ts_snap",
                   help="index into the time series")
     st.write(f"**{tlabel} = {t[j]:g}**")
-    res = _eval_snapshot(fbytes, fname, j, R, lo, hi, t_end_us)
+    res = _eval_snapshot(fbytes, fname, j, R, lo, hi, dt_us)
     t_app_tab = gauss_apparent(res, lo, hi)          # Gaussian-assumption apparent T (table)
     fig = plt.figure(figsize=(11, 4.3))
     plot_profile_eval(fig, res, lo, hi, t_app_gauss=t_app_tab)

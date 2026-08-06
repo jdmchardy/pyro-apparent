@@ -3,15 +3,16 @@ Convert a COMSOL 1-D radial 'Line graph' export into the app's time-series CSV.
 
 The COMSOL file has radius rows (column 0 = R in metres) and one temperature column
 per time. If the column headers carry the times ('@ t=...'), they are used; otherwise
-pass --t-end (seconds) and the times are set to 0..T_end in equal steps.
+pass --dt (the fixed sampling interval, in seconds) and the times are set to
+0, dt, 2 dt, ... .
 
 Usage:
-    python comsol_to_app.py INPUT.txt OUTPUT.csv [--t-end 3.7e-5] [--time-unit us]
+    python comsol_to_app.py INPUT.txt OUTPUT.csv [--dt 1e-7] [--time-unit us]
 
 Example:
     python comsol_to_app.py \\
         test_data_Nicolas/Radial_T_profile_UBS_oppside_130GPa_coarse_mesh_...txt \\
-        my_series.csv --t-end 3.7e-5 --time-unit us
+        my_series.csv --dt 1e-7 --time-unit us
 """
 import argparse
 from planck_model import parse_comsol_line_graph, write_series_csv
@@ -24,14 +25,14 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="COMSOL line-graph .txt export")
     ap.add_argument("output", help="output app-format CSV")
-    ap.add_argument("--t-end", type=float, default=None,
-                    help="T_end in seconds; times = 0..T_end in equal steps "
+    ap.add_argument("--dt", type=float, default=None,
+                    help="fixed sampling interval in seconds; times = 0, dt, 2dt, ... "
                          "(ignored if the file already carries times)")
     ap.add_argument("--time-unit", default="us", choices=list(_UNIT),
                     help="unit the times are written in (default us)")
     a = ap.parse_args()
 
-    t, r, T = parse_comsol_line_graph(a.input, t_end=a.t_end)
+    t, r, T = parse_comsol_line_graph(a.input, dt=a.dt)
     scale = _UNIT[a.time_unit]
     note = f"radius_um, T[K] per time ({a.time_unit}); converted from COMSOL line graph"
     write_series_csv(a.output, t * scale, r, T, note=note)
