@@ -20,6 +20,7 @@ Run locally:   streamlit run streamlit_app.py
 """
 import os
 import io
+import contextlib
 import tempfile
 import numpy as np
 import matplotlib
@@ -249,16 +250,31 @@ def gauss_apparent(res, lam_lo, lam_hi):
 
 
 def data_source(default_path, label, key):
-    """File uploader with a bundled-sample fallback; returns (bytes, name)."""
+    """File uploader. Nothing is loaded until the user uploads a file, or explicitly
+    opts into the bundled example. Returns (bytes, name) or (None, None)."""
     up = st.file_uploader(label, type=["csv", "txt", "dat"], key=key)
     if up is not None:
         return up.getvalue(), up.name
     name = os.path.basename(default_path)
     if os.path.exists(default_path):
-        st.caption(f"Using bundled sample **{name}** (upload a file to replace).")
-        return _read_bytes(default_path), name
-    st.warning(f"No file uploaded and bundled sample {name} not found.")
+        if st.checkbox(f"use the bundled example ({name})", value=False, key=key + "_ex"):
+            return _read_bytes(default_path), name
+        st.info("Upload a file to begin — or tick the box to load the bundled example.")
+    else:
+        st.info("Upload a file to begin.")
     return None, None
+
+
+class _SkipTab(Exception):
+    """Bail out of one tab without halting the whole app (raise _SkipTab() would)."""
+
+
+@contextlib.contextmanager
+def tab_body():
+    try:
+        yield
+    except _SkipTab:
+        pass
 
 
 # ============================================================ sidebar
@@ -284,7 +300,7 @@ st.sidebar.caption(f"$\\lambda_c=\\sqrt{{\\lambda_1\\lambda_2}}$ = {lam_c*1e9:.0
 
 
 # ============================================================ TAB 1: COMSOL IMPORT
-with tab_imp:
+with tab_imp, tab_body():
     st.subheader("1 · Import a COMSOL radial export → app series format")
     st.markdown(
         "Upload a COMSOL **1-D line-graph** export (`Radial_T_profile_*.txt`: column 0 = "
@@ -294,7 +310,8 @@ with tab_imp:
 
     i0, i1 = st.columns([2, 1])
     with i0:
-        ibytes, iname = data_source(os.path.join(HERE, "synthetic_temperatures", "sample_Tseries_diffusion.csv"),
+        ibytes, iname = data_source(os.path.join(HERE, "example_files",
+                                                 "COMSOL_radial_T_100pulses_20umFWHM.txt"),
                                     "Upload COMSOL export (or an app CSV to inspect)",
                                     key="imp_f")
     with i1:
@@ -302,14 +319,14 @@ with tab_imp:
                                  format="%.4f", key="imp_dt",
                                  help="used only when the file carries no times")
     if ibytes is None:
-        st.stop()
+        raise _SkipTab()
     try:
         it, ir, iT = _series_arrays(ibytes, iname, imp_dt)
     except Exception as exc:
         st.error(f"could not read this file: {exc}")
         st.info("Tab 1 needs a **radial** export (column 0 = radius). The point-probe "
                 "file (`Ttab_*.txt`, column 0 = time) is a different format.")
-        st.stop()
+        raise _SkipTab()
 
     im = st.columns(5)
     im[0].metric("radial nodes", f"{ir.size}")
@@ -340,13 +357,17 @@ with tab_imp:
             "\n# radius_um, T[K] per time (µs); converted from " + str(iname) +
             "\n" + "\n".join(",".join(f"{v:.6g}" for v in row)
                              for row in np.column_stack([ir*1e6, iT])))
-    st.download_button("⬇ download app-format series (CSV)", conv,
-                       "series_for_tab2.csv", "text/csv", type="primary",
-                       help="feed this into tab 2")
+    st.session_state["tab1_series"] = dict(data=conv.encode("utf-8"),
+                                           name=f"tab 1 · {iname}")
+    d0, d1 = st.columns([1, 2])
+    d0.download_button("⬇ download app-format series (CSV)", conv,
+                       "series_for_tab2.csv", "text/csv", type="primary")
+    d1.success("This series is now available in **tab 2** — no need to re-upload "
+               "(the download is only if you want to keep it).")
 
 
 # ============================================================ TAB 2: SIMULATED SOP
-with tab_sim:
+with tab_sim, tab_body():
     st.subheader("2 · Simulated SOP — interpolate, time-bin, and fit")
     st.markdown(
         "Load a series (the tab-1 output). The profiles are interpolated onto a finer "
@@ -354,19 +375,29 @@ with tab_sim:
         "**binned over your detector window** and fitted for apparent temperature. "
         "Gaussian profile fits are done on the same binned intervals.")
 
+    handoff = st.session_state.get("tab1_series")
     s0, s1 = st.columns([2, 1])
     with s0:
-        sbytes, sname = data_source(os.path.join(HERE, "synthetic_temperatures", "sample_Tseries_diffusion.csv"),
-                                    "Upload series CSV (from tab 1)", key="sim_f")
+        use_t1 = False
+        if handoff is not None:
+            use_t1 = st.checkbox(f"use the series from **{handoff['name']}**",
+                                 value=True, key="sim_uset1")
+        if use_t1:
+            sbytes, sname = handoff["data"], handoff["name"]
+            st.caption("Using the series imported in tab 1. Untick to load a file instead.")
+        else:
+            sbytes, sname = data_source(
+                os.path.join(HERE, "synthetic_temperatures", "Tseries_diffusion.csv"),
+                "Upload series CSV (from tab 1)", key="sim_f")
     with s1:
         sim_dt = st.number_input("Δt between steps [µs] (COMSOL only)", 1e-4, 1e4, 0.1,
                                  step=0.1, format="%.4f", key="sim_dt")
     if sbytes is None:
-        st.stop()
+        raise _SkipTab()
     try:
         st_t, st_r, st_T = _series_arrays(sbytes, sname, sim_dt)
     except Exception as exc:
-        st.error(f"could not read this file: {exc}"); st.stop()
+        st.error(f"could not read this file: {exc}"); raise _SkipTab()
 
     native = float(np.median(np.diff(np.sort(st_t)))) if st_t.size > 1 else 1.0
     c0, c1, c2, c3 = st.columns(4)
@@ -388,7 +419,7 @@ with tab_sim:
         with st.spinner("interpolating, building spectra and binning…"):
             sim = _run_sim(sbytes, sname, sim_dt, R_um, step_us, bin_us, lo, hi, n_lam)
     except Exception as exc:
-        st.error(f"simulation failed: {exc}"); st.stop()
+        st.error(f"simulation failed: {exc}"); raise _SkipTab()
 
     st.session_state["sim_result"] = dict(
         t=sim["t_bin"], T_app=sim["T_app"], T_peak=sim["T_peak"],
@@ -475,11 +506,11 @@ with tab_sim:
     st.download_button("⬇ download simulated history (CSV)", csv,
                        "simulated_sop_history.csv", "text/csv")
 # ============================================================ TAB 2: SINGLE PROFILE
-with tab_prof:
+with tab_prof, tab_body():
     st.subheader("Single radial profile → forward evaluation")
     c0, c1 = st.columns([2, 1])
     with c0:
-        pbytes, pname = data_source(os.path.join(HERE, "synthetic_temperatures", "sample_Tprofile.csv"),
+        pbytes, pname = data_source(os.path.join(HERE, "synthetic_temperatures", "Tprofile.csv"),
                                     "Upload a T(r) profile (radius[µm], T[K])", key="pf")
     with c1:
         full = st.checkbox("use full profile (no pinhole cut)", value=False, key="pf_full")
@@ -509,7 +540,7 @@ with tab_prof:
 
 
 # ============================================================ TAB 3: GAUSSIAN & UNIVERSAL
-with tab_uni:
+with tab_uni, tab_body():
     st.subheader("Gaussian model & the universal correction")
     c0, c1, c2 = st.columns(3)
     T0 = c0.slider("true peak $T_0$ [K]", 1000, 12000, 5500, step=100)
@@ -554,7 +585,7 @@ with tab_uni:
 
 
 # ============================================================ TAB 4: BATCH UNIVERSALITY
-with tab_batch:
+with tab_batch, tab_body():
     st.subheader("Universality across $(T_0,\\sigma)$ families")
     st.caption("Sweep families to check that the bias collapses onto $\\Phi(R/\\sigma,\\xi)$ "
                "and the master curve.")
@@ -585,7 +616,7 @@ with tab_batch:
 
 
 # ============================================================ TAB 5: ABOUT
-with tab_about:
+with tab_about, tab_body():
     st.markdown(r"""
 ### What this app computes
 
@@ -632,7 +663,7 @@ predicted-vs-true apparent-temperature gap gauges any departure.
 
 
 # ============================================================ TAB: MEASURED SPECTRUM
-with tab_spec:
+with tab_spec, tab_body():
     st.subheader("Measured emission spectrum → apparent T → radial $T(r)$")
     st.markdown(
         "Fit a measured spectrum over the spectrometer window to get the **apparent "
@@ -641,14 +672,14 @@ with tab_spec:
 
     u0, u1, u2, u3 = st.columns([2, 1, 1, 1])
     with u0:
-        xbytes, xname = data_source(os.path.join(HERE, "synthetic_temperatures", "sample_spectrum.csv"),
+        xbytes, xname = data_source(os.path.join(HERE, "synthetic_temperatures", "SOP_spectrum.csv"),
                                     "Upload spectrum (2 columns: wavelength, intensity)",
                                     key="sp_f")
     lam_unit = u1.selectbox("wavelength unit", ["nm", "µm", "m", "Å"], index=0, key="sp_u")
     lam_col = u2.number_input("wavelength column", 0, 20, 0, step=1, key="sp_lc")
     int_col = u3.number_input("intensity column", 0, 20, 1, step=1, key="sp_ic")
     if xbytes is None:
-        st.stop()
+        raise _SkipTab()
     uscale = {"nm": 1e-9, "µm": 1e-6, "m": 1.0, "Å": 1e-10}[lam_unit]
 
     try:
@@ -656,7 +687,7 @@ with tab_spec:
         order = np.argsort(lam_all)
         lam_all, I_all = lam_all[order], I_all[order]
     except Exception as exc:
-        st.error(f"could not read the spectrum: {exc}"); st.stop()
+        st.error(f"could not read the spectrum: {exc}"); raise _SkipTab()
 
     m_fit = (lam_all >= lo) & (lam_all <= hi) & np.isfinite(I_all) & (I_all > 0)
     if m_fit.sum() < 5:
@@ -664,7 +695,7 @@ with tab_spec:
                  f"{lo*1e9:.0f}–{hi*1e9:.0f} nm (data spans "
                  f"{lam_all.min()*1e9:.0f}–{lam_all.max()*1e9:.0f} nm). "
                  "Adjust the window in the sidebar or check the wavelength unit.")
-        st.stop()
+        raise _SkipTab()
 
     # ---- geometry ----
     g0, g1, g2 = st.columns([1, 1, 2])
@@ -713,7 +744,7 @@ with tab_spec:
             T_peak_sp, info = correct_temperature(T_app_sp, ros_sp, lo, hi,
                                                   return_info=True)
     except Exception as exc:
-        st.error(f"fit/inversion failed: {exc}"); st.stop()
+        st.error(f"fit/inversion failed: {exc}"); raise _SkipTab()
 
     k = st.columns(5)
     k[0].metric("points fitted", f"{int(m_fit.sum())}")
@@ -793,7 +824,7 @@ with tab_spec:
 
 
 # ============================================================ TAB 3: EXPERIMENTAL SPECTRA
-with tab_exp:
+with tab_exp, tab_body():
     st.subheader("3 · Experimental emission spectra → apparent T vs time")
     st.markdown(
         "Upload a **wide spectra file**: column 0 = wavelength [nm], each further column "
@@ -803,11 +834,12 @@ with tab_exp:
 
     e0, e1 = st.columns([3, 1])
     with e0:
-        ebytes, ename = data_source(os.path.join(HERE, "synthetic_spectrums", "sample_spectra_series.csv"),
+        ebytes, ename = data_source(os.path.join(HERE, "example_files",
+                                                 "experimental_SOP_spectra_100pulses.csv"),
                                     "Upload experimental spectra (wide format)",
                                     key="exp_f")
     if ebytes is None:
-        st.stop()
+        raise _SkipTab()
     with e1:
         elabel = st.text_input("time unit label", "µs", key="exp_u")
 
@@ -815,7 +847,7 @@ with tab_exp:
         with st.spinner("fitting Planck to each spectrum…"):
             ex = _fit_spectra_series(ebytes, ename, lo, hi)
     except Exception as exc:
-        st.error(f"could not process this file: {exc}"); st.stop()
+        st.error(f"could not process this file: {exc}"); raise _SkipTab()
 
     st.session_state["exp_result"] = dict(t=ex["times"], T_app=ex["T_app"],
                                           A_app=ex["A_app"], name=str(ename))
@@ -880,7 +912,7 @@ with tab_exp:
 
 
 # ============================================================ TAB 4: COMPARE
-with tab_cmp:
+with tab_cmp, tab_body():
     st.subheader("4 · Simulation vs experiment")
     sim_r = st.session_state.get("sim_result")
     exp_r = st.session_state.get("exp_result")
