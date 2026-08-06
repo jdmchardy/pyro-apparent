@@ -24,17 +24,30 @@ streamlit run streamlit_app.py
 
 ## Tabs
 
-- **⏱ Time series** *(main)* — upload a sequence of radial profiles; get the four
-  temperature histories (actual peak, fitted-Gaussian peak, apparent, pinhole-edge), a
-  `T(r,t)` map, the collected emission spectra vs time, the fit-geometry/bias evolution,
-  and a snapshot explorer showing each profile + Gaussian fit (pinhole shaded) and its
-  collected spectrum. Downloadable results.
-- **🔭 Measured spectrum → T(r)** — upload an experimental emission spectrum, fit a Planck
-  over the spectrometer window to get the **apparent temperature**, give the **pinhole
-  diameter**, then invert the bias under the Gaussian assumption to recover the **true
-  peak temperature** and the radial profile. Downloadable inferred `T(r)`.
+**Pipeline (1 → 4)**
+
+1. **📥 COMSOL import** — upload a COMSOL 1-D radial line-graph export, set Δt if the
+   file carries no times, preview the profiles and the `T(r,t)` map, and **download the
+   app-format series** for tab 2.
+2. **🔬 Simulated SOP** — load that series, interpolate it onto a finer time base, build
+   synthetic emission spectra through the pinhole, **bin them over your detector time
+   window**, and fit each bin: apparent `T`, Gaussian profile fit (`T₀`, `σ`, `R/σ`),
+   lookup-table apparent `T`, peak and edge temperatures. Binned spectrogram, histories,
+   bin explorer, CSV download.
+3. **🔭 Experimental spectra** — upload a wide file of measured spectra (one column per
+   time) and fit a Planck over the spectrometer window to each, giving the **experimental
+   apparent `T` vs time** plus fitted amplitude. Spectrogram, spectrum inspector, CSV.
+4. **📊 Compare** — overlay the simulated and experimental apparent temperatures with an
+   adjustable time shift; mean/RMS difference, reduced χ², Pearson r and R², residuals,
+   and optionally the universal correction of the experimental data to peak `T`.
+
+**Supporting tools**
+
 - **📈 Single profile** — one snapshot: apparent T, collected spectrum, Gaussian fit, and
   the universal-corrected peak.
+- **🔎 Spectrum → T(r)** — fit a single measured spectrum for apparent T, then invert
+  under the Gaussian assumption to peak T and a radial profile (σ known, saturated, or
+  fitted from the spectral shape).
 - **🎯 Gaussian & universal** — slider explorer for `(T₀, σ, R)`; apparent T, bias, the
   master curve `ξE₁(ξ)eˣ`, and the `ρ(R/σ, ξ)` lookup table with your point marked.
 - **🌐 Universality (batch)** — sweep `(T₀, σ)` families and see the bias collapse.
@@ -53,11 +66,14 @@ If the times line is absent, column indices are used. Comma or whitespace delimi
 
 **Single profile** — two columns: radius [µm], `T` [K].
 
+**Experimental spectra series** (tab 3) — wide CSV: column 0 = wavelength [nm]; each
+further column = intensity at one time; times in a `# times = ...` comment.
+
 **Measured spectrum** — two columns: wavelength, intensity (arb.). The wavelength unit
 (nm / µm / m / Å) and the column indices are selectable in the tab.
 
-Bundled samples: `sample_Tseries_diffusion.csv` (10 µm-FWHM beam + radial diffusion over
-100 µs), `sample_Tprofile.csv` (peaked), `near_Gaussian_Tprofile.csv`.
+Bundled samples live in `synthetic_temperatures/` (radial profiles and series) and
+`synthetic_spectrums/` (single spectra and the `sample_spectra_series.csv` time series).
 
 ## How T_app is obtained (time-series tab)
 

@@ -332,7 +332,7 @@ def evaluate_profile(r, T_r, lam_lo, lam_hi, R=None, eps=1.0, compare_gaussian=T
     return res
 
 # ----------------------------------------------------------------- TIME SERIES OF PROFILES
-def load_profile_series(path):
+def load_profile_series(path, col0_scale=1e-6):
     """Load a time series of radial profiles from one wide file.
 
     Layout: column 0 = radius [um]; each further column = temperature [K] at one time.
@@ -369,12 +369,61 @@ def load_profile_series(path):
             break
     if data is None or data.ndim < 2 or data.shape[1] < 2:
         raise ValueError("need a radius column plus >=1 temperature column")
-    r = data[:, 0] * 1e-6
+    r = data[:, 0] * col0_scale
     T_cols = data[:, 1:]
     n_t = T_cols.shape[1]
     if times is None or len(times) != n_t:
         times = np.arange(n_t, dtype=float)
     return times, r, T_cols
+
+def load_spectra_series(path):
+    """Load a time series of emission spectra from one wide file.
+
+    Layout: column 0 = wavelength [nm]; each further column = intensity at one time,
+    with the times in a '# times = ...' comment. Same convention as the radial-profile
+    series. Returns (times [n_t], lam [m, n_lam], I_cols [(n_lam, n_t)]).
+    """
+    return load_profile_series(path, col0_scale=1e-9)
+
+# ----------------------------------------------------------------- time resampling
+def resample_series_time(times, r, cols, t_new):
+    """Interpolate a wide series (r, t) -> (r, t_new), linear with extrapolation.
+
+    `r` is the row coordinate (radius or wavelength); `cols` has shape (n_r, n_t).
+    """
+    times = np.asarray(times, float); r = np.asarray(r, float)
+    cols = np.asarray(cols, float); t_new = np.asarray(t_new, float)
+    if times.size < 2:
+        raise ValueError("need at least 2 times to interpolate")
+    order = np.argsort(times)
+    interp = RegularGridInterpolator((r, times[order]), cols[:, order],
+                                     method="linear", bounds_error=False,
+                                     fill_value=None)
+    Rg, Tg = np.meshgrid(r, t_new, indexing="ij")
+    return interp(np.stack([Rg.ravel(), Tg.ravel()], axis=-1)).reshape(r.size, t_new.size)
+
+def bin_columns(times, cols, bin_width, t_start=None, t_stop=None):
+    """Average columns of `cols` (n_r, n_t) inside consecutive bins of `bin_width`.
+
+    Returns (t_centres, binned_cols, counts). Empty bins are dropped. This averages
+    the SIGNAL over each window -- the detector integrates light, not temperature.
+    """
+    times = np.asarray(times, float); cols = np.asarray(cols, float)
+    bin_width = float(bin_width)
+    if bin_width <= 0:
+        raise ValueError("bin width must be > 0")
+    t0 = times.min() if t_start is None else float(t_start)
+    t1 = times.max() if t_stop is None else float(t_stop)
+    edges = np.arange(t0, t1 + bin_width, bin_width)
+    cen, out, cnt = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (times >= a) & (times < b)
+        if not m.any():
+            continue
+        cen.append(0.5*(a + b)); out.append(cols[:, m].mean(axis=1)); cnt.append(int(m.sum()))
+    if not cen:
+        raise ValueError("no populated bins -- check the bin width and time range")
+    return np.array(cen), np.column_stack(out), np.array(cnt)
 
 def parse_comsol_line_graph(path, dt=None, times=None):
     """Parse a COMSOL 1-D 'Line graph' export into (times, r[m], T[n_r, n_t]).

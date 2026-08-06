@@ -1,10 +1,16 @@
 """
 Grey-body pyrometry of a Gaussian hot spot -- Streamlit app.
 
-Tabs:
-  * Time series (main)   -- evaluate a sequence of radial T(r) snapshots.
-  * Measured spectrum    -- fit an experimental spectrum, invert to peak T and T(r).
+Pipeline (tabs 1-4):
+  1 COMSOL import       -- convert a COMSOL radial export into the app's series format.
+  2 Simulated SOP       -- interpolate + time-bin a series, build synthetic SOP
+                           spectra, fit Gaussian profiles and apparent temperature.
+  3 Experimental spectra-- fit Planck to measured spectra -> apparent T vs time.
+  4 Compare             -- simulated vs experimental apparent T vs time.
+
+Supporting tools:
   * Single profile       -- one snapshot: apparent T, spectrum, Gaussian comparison.
+  * Spectrum -> T(r)     -- fit one spectrum, invert to peak T and radial profile.
   * Gaussian & universal -- explore the analytic model, master curve, lookup table.
   * Universality (batch) -- collapse of the bias across (T0, sigma) families.
   * About / theory       -- what the app computes and how.
@@ -27,7 +33,8 @@ from planck_model import (spectrum, spectrum_from_profile, planck, fit_temperatu
                           correct_temperature, run_config,
                           load_profile, evaluate_profile,
                           load_profile_series, evaluate_profile_series,
-                          parse_comsol_line_graph,
+                          parse_comsol_line_graph, load_spectra_series,
+                          resample_series_time, bin_columns, write_series_csv,
                           get_ratio_table, ratio_from_table, C2)
 from planck_plots import plot_comparison, plot_profile_eval
 
@@ -97,6 +104,84 @@ def _eval_series(file_bytes, name, R, method, lo, hi, dt_us):
 def _eval_snapshot(file_bytes, name, j, R, lo, hi, dt_us):
     _, r, T = _series_arrays(file_bytes, name, dt_us)
     return evaluate_profile(r, T[:, j], lo, hi, R=R)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _run_sim(file_bytes, name, dt_us, R_um, step_us, bin_us, lo, hi, n_lam):
+    """Interpolate a series onto a finer time base, build synthetic spectra through the
+    pinhole, bin them over the detector window, and fit each bin."""
+    times, r, T = _series_arrays(file_bytes, name, dt_us)
+    R = R_um * 1e-6
+    t_fine = np.arange(times.min(), times.max() + 0.5*step_us, step_us)
+    T_fine = resample_series_time(times, r, T, t_fine)
+    lam = np.linspace(lo, hi, int(n_lam))
+
+    spec = np.empty((lam.size, t_fine.size))
+    for j in range(t_fine.size):
+        spec[:, j] = spectrum_from_profile(lam, r, T_fine[:, j], R)
+
+    t_bin, spec_bin, counts = bin_columns(t_fine, spec, bin_us)
+    _, prof_bin, _ = bin_columns(t_fine, T_fine, bin_us)
+
+    n = t_bin.size
+    T_app = np.full(n, np.nan); A_app = np.full(n, np.nan)
+    T_peak = np.full(n, np.nan); T_gauss = np.full(n, np.nan)
+    sigma = np.full(n, np.nan); T_edge = np.full(n, np.nan)
+    T_app_tab = np.full(n, np.nan)
+    tab = get_ratio_table(lo, hi)
+    floor = 1e-9 * np.nanmax(spec_bin) if np.isfinite(spec_bin).any() else 0.0
+    for j in range(n):
+        T_peak[j] = float(np.nanmax(prof_bin[:, j]))
+        T_edge[j] = float(np.interp(R, r, prof_bin[:, j]))
+        col = spec_bin[:, j]
+        if np.isfinite(col).all() and np.nanmax(col) > floor and np.all(col > 0):
+            try:
+                T_app[j], A_app[j] = fit_temperature(lam, col,
+                                                     T_guess=max(T_peak[j], 500.0))
+            except Exception:
+                pass
+        try:
+            T0g, sg = fit_gaussian_profile(r, prof_bin[:, j], R)
+            T_gauss[j], sigma[j] = T0g, sg
+            T_app_tab[j] = float(T0g * ratio_from_table(
+                tab, R/sg, float(xi_window(T0g, lo, hi))))
+        except Exception:
+            pass
+    return dict(t_fine=t_fine, n_fine=int(t_fine.size), lam=lam, t_bin=t_bin,
+                spec_bin=spec_bin, counts=counts, prof_bin=prof_bin,
+                T_app=T_app, A_app=A_app, T_peak=T_peak, T_gauss=T_gauss,
+                sigma=sigma, T_edge=T_edge, T_app_tab=T_app_tab)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _fit_spectra_series(file_bytes, name, lo, hi):
+    """Fit a Planck (free amplitude + T) to every column of a wide spectra file."""
+    suffix = os.path.splitext(name)[1] or ".csv"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(file_bytes); path = f.name
+    try:
+        times, lam, I = load_spectra_series(path)
+    finally:
+        os.unlink(path)
+    m = (lam >= lo) & (lam <= hi)
+    if m.sum() < 5:
+        raise ValueError(f"only {int(m.sum())} points inside {lo*1e9:.0f}-{hi*1e9:.0f} nm "
+                         f"(data spans {lam.min()*1e9:.0f}-{lam.max()*1e9:.0f} nm)")
+    n = I.shape[1]
+    T = np.full(n, np.nan); A = np.full(n, np.nan)
+    guess = 3000.0
+    for j in range(n):
+        col = I[m, j]
+        good = np.isfinite(col) & (col > 0)
+        if good.sum() < 5:
+            continue
+        try:
+            T[j], A[j] = fit_temperature(lam[m][good], col[good], T_guess=guess)
+            if np.isfinite(T[j]):
+                guess = T[j]
+        except Exception:
+            pass
+    return dict(times=times, lam=lam, I=I, mask=m, T_app=T, A_app=A)
 
 
 @st.cache_data(show_spinner=False)
@@ -191,187 +276,210 @@ lam_c = float(np.sqrt(lo * hi))
 st.sidebar.caption(f"$\\lambda_c=\\sqrt{{\\lambda_1\\lambda_2}}$ = {lam_c*1e9:.0f} nm  ·  "
                    f"$c_2/\\lambda_c$ = {C2/lam_c:.0f} K (so $\\xi=${C2/lam_c:.0f}$/T_0$)")
 
-(tab_ts, tab_spec, tab_prof, tab_uni, tab_batch, tab_about) = st.tabs(
-    ["⏱ Time series", "🔭 Measured spectrum → T(r)", "📈 Single profile",
+(tab_imp, tab_sim, tab_exp, tab_cmp, tab_prof, tab_spec,
+ tab_uni, tab_batch, tab_about) = st.tabs(
+    ["1 · 📥 COMSOL import", "2 · 🔬 Simulated SOP", "3 · 🔭 Experimental spectra",
+     "4 · 📊 Compare", "📈 Single profile", "🔎 Spectrum → T(r)",
      "🎯 Gaussian & universal", "🌐 Universality (batch)", "📖 About / theory"])
 
 
-# ============================================================ TAB 1: TIME SERIES
-with tab_ts:
-    st.subheader("Time series of radial temperature profiles")
+# ============================================================ TAB 1: COMSOL IMPORT
+with tab_imp:
+    st.subheader("1 · Import a COMSOL radial export → app series format")
     st.markdown(
-        "Upload the app **wide CSV** (column 0 = radius [µm]; further columns = $T$ [K] per "
-        "time; times in a `# times = …` comment) **or a COMSOL 1-D line-graph export** — "
-        "COMSOL files are converted automatically.")
+        "Upload a COMSOL **1-D line-graph** export (`Radial_T_profile_*.txt`: column 0 = "
+        "radius in metres, one temperature column per time). The times are read from the "
+        "column headers when present; otherwise give the fixed sampling interval Δt. "
+        "Download the converted file and use it in tab 2.")
 
-    c0, c1, c2, c3 = st.columns([2, 1, 1, 1])
-    with c0:
-        fbytes, fname = data_source(os.path.join(HERE, "sample_Tseries_diffusion.csv"),
-                                    "Upload time-series CSV or COMSOL .txt", key="ts")
-    with c1:
-        R_um = st.number_input("pinhole R [µm]", 0.5, 500.0, 25.0, step=1.0, key="ts_R")
-    with c2:
-        method = st.selectbox("T_app method", ["table", "gaussian", "numerical"],
-                              index=0, key="ts_m",
-                              help="table: fast + exact across R/σ; gaussian: analytic "
-                                   "Gaussian fit; numerical: integrate the real profile.")
-    with c3:
-        tlabel = st.text_input("time axis label", "time (µs)", key="ts_t")
-
-    if fbytes is None:
+    i0, i1 = st.columns([2, 1])
+    with i0:
+        ibytes, iname = data_source(os.path.join(HERE, "synthetic_temperatures", "sample_Tseries_diffusion.csv"),
+                                    "Upload COMSOL export (or an app CSV to inspect)",
+                                    key="imp_f")
+    with i1:
+        imp_dt = st.number_input("Δt between steps [µs]", 1e-4, 1e4, 0.1, step=0.1,
+                                 format="%.4f", key="imp_dt",
+                                 help="used only when the file carries no times")
+    if ibytes is None:
         st.stop()
-
-    # COMSOL line-graph files carry no times -> snapshots at a fixed interval dt
-    is_comsol = _is_comsol(fbytes)
-    dt_us = 0.0
-    if is_comsol:
-        cc0, cc1 = st.columns([1, 3])
-        dt_us = cc0.number_input("COMSOL Δt between steps [µs]", 1e-4, 1e4, 0.1,
-                                 step=0.1, format="%.4f", key="ts_dt")
-        cc1.info("COMSOL line-graph detected — times aren't in the file, so they're set to "
-                 "0, Δt, 2Δt, … from the fixed sampling interval. Set Δt (µs) for this run; "
-                 "replace with a time-labelled export later and it will be read automatically.")
-
-    R = R_um * 1e-6
     try:
-        times, r, T_cols = _series_arrays(fbytes, fname, dt_us)
-        n_t = T_cols.shape[1]
-        with st.spinner("evaluating series…"):
-            s = _eval_series(fbytes, fname, R, method, lo, hi, dt_us)
-            s_num = s if method == "numerical" else _eval_series(
-                fbytes, fname, R, "numerical", lo, hi, dt_us)
+        it, ir, iT = _series_arrays(ibytes, iname, imp_dt)
     except Exception as exc:
         st.error(f"could not read this file: {exc}")
+        st.info("Tab 1 needs a **radial** export (column 0 = radius). The point-probe "
+                "file (`Ttab_*.txt`, column 0 = time) is a different format.")
         st.stop()
 
-    # ---- headline metrics (bias/apparent are always the true numerical fit) ----
-    jpk = int(np.nanargmax(s_num["T_peak"]))
-    bias_num = (s_num["T_app"]/s_num["T_peak"] - 1)*100
-    approx_gap = float(np.nanmax(np.abs(s["T_app"] - s_num["T_app"])))
-    m = st.columns(5)
-    m[0].metric("snapshots", f"{n_t}")
-    m[1].metric("max peak T", f"{np.nanmax(s_num['T_peak']):.0f} K")
-    m[2].metric("apparent T @ hottest (numerical)", f"{s_num['T_app'][jpk]:.0f} K")
-    m[3].metric("max bias (numerical)", f"{np.nanmin(bias_num):+.1f} %",
-                help="apparent (numerical) vs true peak")
-    if method != "numerical":
-        m[4].metric("max Gaussian error", f"{approx_gap:.0f} K",
-                    help=f"max |{METHOD_LABEL[method]} − numerical| apparent-T over the run")
-    else:
-        m[4].metric("edge T @ hottest", f"{s_num['T_edge'][jpk]:.0f} K")
+    im = st.columns(5)
+    im[0].metric("radial nodes", f"{ir.size}")
+    im[1].metric("time steps", f"{iT.shape[1]}")
+    im[2].metric("radius range", f"0 – {ir.max()*1e6:.1f} µm")
+    im[3].metric("time range", f"{it.min():g} – {it.max():g} µs")
+    im[4].metric("T range", f"{iT.min():.0f} – {iT.max():.0f} K")
 
-    # ---- main history plot ----
-    st.markdown("#### Temperature history through the pinhole")
-    fig, ax = plt.subplots(figsize=(11, 4.4))
-    t = s_num["times"]
-    ax.fill_between(t, s_num["T_app"], s_num["T_peak"], color="crimson", alpha=.07,
-                    label="measurement bias (numerical)")
-    ax.plot(t, s_num["T_peak"], "-o", color="k", ms=3, lw=1.9, label="actual peak $T$ (data)")
-    ax.plot(t, s_num["T_gauss"], "--", color="seagreen", lw=1.6, label="fitted Gaussian peak $T_0$")
-    ax.plot(t, s_num["T_app"], "-", color="crimson", lw=2.0,
-            label="apparent $T$ (numerical, true fit)")
-    if method != "numerical":
-        ax.plot(t, s["T_app"], "-.", color="darkorange", lw=1.8,
-                label=f"apparent $T$ (Gaussian, {METHOD_LABEL[method]})")
-    ax.plot(t, s_num["T_edge"], ":", color="steelblue", lw=2.2,
-            label=f"$T$ at pinhole edge (R={R_um:g} µm)")
-    ax.set_xlabel(tlabel); ax.set_ylabel("temperature (K)")
-    ax.legend(ncol=2, fontsize=9); ax.grid(alpha=.25)
-    st.pyplot(fig, use_container_width=True)
-
-    # ---- space-time heatmap + spectra overlay ----
-    cA, cB = st.columns(2)
-    with cA:
+    p0, p1 = st.columns(2)
+    with p0:
+        st.markdown("#### Radial profiles")
+        fig, ax = plt.subplots(figsize=(6, 4.0))
+        idx = np.linspace(0, iT.shape[1]-1, min(8, iT.shape[1])).round().astype(int)
+        for c, k in zip(colormaps["inferno"](np.linspace(.1, .85, len(idx))), idx):
+            ax.plot(ir*1e6, iT[:, k], color=c, lw=1.5, label=f"{it[k]:g}")
+        ax.set_xlabel(r"$r$ (µm)"); ax.set_ylabel(r"$T(r)$ (K)")
+        ax.legend(fontsize=7, title="time (µs)", ncol=2); ax.grid(alpha=.25)
+        st.pyplot(fig, use_container_width=True)
+    with p1:
         st.markdown("#### $T(r,t)$ map")
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        pm = ax.pcolormesh(t, r*1e6, T_cols, shading="auto", cmap="inferno")
-        ax.axhline(R_um, color="cyan", ls="--", lw=1.2, label=f"pinhole R={R_um:g} µm")
+        fig, ax = plt.subplots(figsize=(6, 4.0))
+        pm = ax.pcolormesh(it, ir*1e6, iT, shading="auto", cmap="inferno")
         fig.colorbar(pm, ax=ax, label="$T$ (K)")
-        ax.set_ylim(0, min(r.max()*1e6, R_um*3))
-        ax.set_xlabel(tlabel); ax.set_ylabel(r"$r$ (µm)")
-        ax.legend(fontsize=8, loc="upper right")
+        ax.set_xlabel("time (µs)"); ax.set_ylabel(r"$r$ (µm)")
         st.pyplot(fig, use_container_width=True)
-    with cB:
-        st.markdown("#### Collected emission spectra vs time")
+
+    conv = ("# times = " + " ".join(f"{x:g}" for x in it) +
+            "\n# radius_um, T[K] per time (µs); converted from " + str(iname) +
+            "\n" + "\n".join(",".join(f"{v:.6g}" for v in row)
+                             for row in np.column_stack([ir*1e6, iT])))
+    st.download_button("⬇ download app-format series (CSV)", conv,
+                       "series_for_tab2.csv", "text/csv", type="primary",
+                       help="feed this into tab 2")
+
+
+# ============================================================ TAB 2: SIMULATED SOP
+with tab_sim:
+    st.subheader("2 · Simulated SOP — interpolate, time-bin, and fit")
+    st.markdown(
+        "Load a series (the tab-1 output). The profiles are interpolated onto a finer "
+        "time base, synthetic emission spectra are built through the pinhole, then "
+        "**binned over your detector window** and fitted for apparent temperature. "
+        "Gaussian profile fits are done on the same binned intervals.")
+
+    s0, s1 = st.columns([2, 1])
+    with s0:
+        sbytes, sname = data_source(os.path.join(HERE, "synthetic_temperatures", "sample_Tseries_diffusion.csv"),
+                                    "Upload series CSV (from tab 1)", key="sim_f")
+    with s1:
+        sim_dt = st.number_input("Δt between steps [µs] (COMSOL only)", 1e-4, 1e4, 0.1,
+                                 step=0.1, format="%.4f", key="sim_dt")
+    if sbytes is None:
+        st.stop()
+    try:
+        st_t, st_r, st_T = _series_arrays(sbytes, sname, sim_dt)
+    except Exception as exc:
+        st.error(f"could not read this file: {exc}"); st.stop()
+
+    native = float(np.median(np.diff(np.sort(st_t)))) if st_t.size > 1 else 1.0
+    c0, c1, c2, c3 = st.columns(4)
+    R_um = c0.number_input("pinhole radius R [µm]", 0.1, 500.0, 15.0, step=1.0, key="sim_R")
+    step_us = c1.number_input("interpolation step [µs]", 1e-4, 1e4,
+                              float(f"{native/4:.4g}"), format="%.4f", key="sim_step",
+                              help=f"file's native step is {native:g} µs")
+    bin_us = c2.number_input("detector time bin [µs]", 1e-4, 1e4,
+                             float(f"{native:.4g}"), format="%.4f", key="sim_bin",
+                             help="spectra are averaged over this window before fitting")
+    n_lam = c3.select_slider("wavelength points", [100, 200, 400], value=200, key="sim_nl")
+
+    R = R_um * 1e-6
+    if R > st_r.max()*1.0000001:
+        st.warning(f"R = {R_um:g} µm exceeds the data extent ({st_r.max()*1e6:.2f} µm) — "
+                   f"no truncation applied; effective radius {st_r.max()*1e6:.2f} µm.")
+
+    try:
+        with st.spinner("interpolating, building spectra and binning…"):
+            sim = _run_sim(sbytes, sname, sim_dt, R_um, step_us, bin_us, lo, hi, n_lam)
+    except Exception as exc:
+        st.error(f"simulation failed: {exc}"); st.stop()
+
+    st.session_state["sim_result"] = dict(
+        t=sim["t_bin"], T_app=sim["T_app"], T_peak=sim["T_peak"],
+        T_gauss=sim["T_gauss"], sigma=sim["sigma"], R_um=R_um, name=str(sname))
+
+    m = st.columns(5)
+    m[0].metric("interpolated steps", f"{sim['n_fine']}")
+    m[1].metric("time bins", f"{len(sim['t_bin'])}")
+    m[2].metric("samples per bin", f"{sim['counts'].mean():.1f}")
+    m[3].metric("max peak T", f"{np.nanmax(sim['T_peak']):.0f} K")
+    m[4].metric("max apparent T", f"{np.nanmax(sim['T_app']):.0f} K",
+                f"{np.nanmax(sim['T_app'])-np.nanmax(sim['T_peak']):+.0f} K")
+
+    st.markdown("#### Simulated SOP spectrogram (binned)")
+    fig, ax = plt.subplots(figsize=(11, 3.8))
+    pm = ax.pcolormesh(sim["t_bin"], sim["lam"]*1e9, sim["spec_bin"],
+                       shading="auto", cmap="inferno")
+    fig.colorbar(pm, ax=ax, label="emission (a.u.)")
+    ax.set_xlabel("time (µs)"); ax.set_ylabel("wavelength (nm)"); ax.invert_yaxis()
+    st.pyplot(fig, use_container_width=True)
+
+    a0, a1 = st.columns(2)
+    with a0:
+        st.markdown("#### Temperature history")
         fig, ax = plt.subplots(figsize=(6, 4.2))
-        lam = np.logspace(np.log10(300e-9), np.log10(3e-6), 240)
-        idx = np.linspace(0, n_t-1, min(7, n_t)).round().astype(int)
-        cols = colormaps["inferno"](np.linspace(0.1, 0.9, len(idx)))
-        for k, c in zip(idx, cols):
-            F = spectrum_from_profile(lam, r, T_cols[:, k], R)
-            if F.max() > 0:
-                ax.plot(lam*1e6, F/F.max(), color=c, lw=1.6, label=f"{t[k]:g}")
-        ax.axvspan(lo*1e6, hi*1e6, color="orange", alpha=.2)
-        ax.set_xlim(0, 3); ax.set_xlabel(r"$\lambda$ (µm)")
-        ax.set_ylabel(r"$F/F_{\max}$ (per snapshot)")
-        ax.legend(fontsize=7, title=tlabel, ncol=2); ax.grid(alpha=.25)
+        ax.plot(sim["t_bin"], sim["T_peak"], "-o", color="k", ms=3, lw=1.6,
+                label="peak $T$ (data)")
+        ax.plot(sim["t_bin"], sim["T_gauss"], "--", color="seagreen", lw=1.5,
+                label="fitted Gaussian peak $T_0$")
+        ax.plot(sim["t_bin"], sim["T_app"], "-", color="crimson", lw=1.8,
+                label="apparent $T$ (binned spectra)")
+        ax.plot(sim["t_bin"], sim["T_app_tab"], "-.", color="darkorange", lw=1.5,
+                label="apparent $T$ (Gaussian + lookup)")
+        ax.plot(sim["t_bin"], sim["T_edge"], ":", color="steelblue", lw=1.8,
+                label=f"$T$ at edge (R={R_um:g} µm)")
+        ax.set_xlabel("time (µs)"); ax.set_ylabel("temperature (K)")
+        ax.legend(fontsize=7.5, ncol=2); ax.grid(alpha=.25)
+        st.pyplot(fig, use_container_width=True)
+    with a1:
+        st.markdown("#### Fit geometry and bias")
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(sim["t_bin"], R/np.array(sim["sigma"]), color="purple", lw=1.7,
+                label=r"$R/\sigma$")
+        ax.set_xlabel("time (µs)"); ax.set_ylabel(r"$R/\sigma$", color="purple")
+        ax.tick_params(axis="y", labelcolor="purple"); ax.grid(alpha=.25)
+        ax2 = ax.twinx()
+        ax2.plot(sim["t_bin"], (np.array(sim["T_app"])/np.array(sim["T_peak"])-1)*100,
+                 color="crimson", lw=1.7)
+        ax2.set_ylabel("apparent-$T$ bias (%)", color="crimson")
+        ax2.tick_params(axis="y", labelcolor="crimson")
         st.pyplot(fig, use_container_width=True)
 
-    # ---- geometry / bias evolution ----
-    st.markdown("#### Fit geometry and bias over time")
-    fig, ax = plt.subplots(figsize=(11, 3.2))
-    ax.plot(t, R / s_num["sigma"], color="purple", lw=1.8, label=r"$R/\sigma$ (fit)")
-    ax.set_xlabel(tlabel); ax.set_ylabel(r"$R/\sigma$", color="purple")
-    ax.tick_params(axis="y", labelcolor="purple"); ax.grid(alpha=.25)
-    ax2 = ax.twinx()
-    ax2.plot(t, (s_num["T_app"]/s_num["T_peak"]-1)*100, color="crimson", lw=1.8,
-             label="bias (%)")
-    ax2.set_ylabel("apparent-$T$ bias (numerical, %)", color="crimson")
-    ax2.tick_params(axis="y", labelcolor="crimson")
-    st.pyplot(fig, use_container_width=True)
+    st.markdown("#### Bin explorer")
+    jb = st.slider("time bin", 0, len(sim["t_bin"])-1,
+                   int(np.nanargmax(sim["T_peak"])), key="sim_j")
+    st.write(f"**t = {sim['t_bin'][jb]:g} µs**  ·  {sim['counts'][jb]} interpolated samples")
+    b0, b1 = st.columns(2)
+    with b0:
+        fig, ax = plt.subplots(figsize=(6, 3.8))
+        ax.axvspan(0, R_um, color="skyblue", alpha=.20, label="pinhole")
+        ax.plot(st_r*1e6, sim["prof_bin"][:, jb], "k-", lw=2, label="binned $T(r)$")
+        sg, T0g = sim["sigma"][jb], sim["T_gauss"][jb]
+        ax.plot(st_r*1e6, T0g*np.exp(-(st_r**2)/(2*sg**2)), "--", color="seagreen",
+                lw=1.6, label=f"Gaussian fit ($\\sigma$={sg*1e6:.1f} µm)")
+        ax.axhline(sim["T_app"][jb], color="crimson", ls="--", lw=1.3,
+                   label=f"apparent {sim['T_app'][jb]:.0f} K")
+        ax.set_xlabel(r"$r$ (µm)"); ax.set_ylabel("$T$ (K)")
+        ax.legend(fontsize=7.5); ax.grid(alpha=.25)
+        st.pyplot(fig, use_container_width=True)
+    with b1:
+        fig, ax = plt.subplots(figsize=(6, 3.8))
+        sp = sim["spec_bin"][:, jb]
+        ax.plot(sim["lam"]*1e9, sp, "k-", lw=2, label="binned spectrum")
+        ax.plot(sim["lam"]*1e9, planck(sim["lam"], sim["T_app"][jb], sim["A_app"][jb]),
+                "r--", lw=1.6, label=f"Planck fit {sim['T_app'][jb]:.0f} K")
+        ax.set_xlabel("wavelength (nm)"); ax.set_ylabel("emission (a.u.)")
+        ax.legend(fontsize=7.5); ax.grid(alpha=.25)
+        st.pyplot(fig, use_container_width=True)
 
-    # ---- snapshot explorer ----
-    st.markdown("#### Snapshot explorer")
-    st.caption("Pick a time to inspect the radial profile + Gaussian fit (pinhole shaded), and "
-               "the **numerically-collected** spectrum (black) with its **best-fit single "
-               "Planck** (red). Green dotted = analytic Gaussian-surrogate spectrum.")
-    j = st.slider("snapshot", 0, n_t-1, jpk, key="ts_snap",
-                  help="index into the time series")
-    st.write(f"**{tlabel} = {t[j]:g}**")
-    res = _eval_snapshot(fbytes, fname, j, R, lo, hi, dt_us)
-    t_app_tab = gauss_apparent(res, lo, hi)          # Gaussian-assumption apparent T (table)
-    fig = plt.figure(figsize=(11, 4.3))
-    plot_profile_eval(fig, res, lo, hi, t_app_gauss=t_app_tab)
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    st.pyplot(fig, use_container_width=True)
-    g = res.get("gauss") or {}
-    sm = st.columns(5)
-    sm[0].metric("actual peak", f"{res['T_peak']:.0f} K")
-    sm[1].metric("apparent (numerical)", f"{res['T_app']:.0f} K")
-    if t_app_tab is not None:
-        sm[2].metric("apparent (Gaussian/table)", f"{t_app_tab:.0f} K",
-                     f"{t_app_tab - res['T_app']:+.0f} K vs numerical")
-    else:
-        sm[2].metric("apparent (Gaussian/table)", "—")
-    sm[3].metric("edge T(R)", f"{float(np.interp(R, r, T_cols[:, j])):.0f} K")
-    sm[4].metric("R/σ, ξ", f"{g.get('R_over_sigma', float('nan')):.2f}, {res['xi']:.2f}")
-
-    # ---- download ----
-    out = np.column_stack([t, s_num["T_peak"], s_num["T_gauss"], s_num["T_app"],
-                           s["T_app"], s_num["T_edge"], s_num["sigma"]*1e6])
-    header = f"time,T_peak_K,T_gauss_K,T_app_numerical_K,T_app_{method}_K,T_edge_K,sigma_um"
-    csv = header + "\n" + "\n".join(
-        ",".join(f"{v:.6g}" for v in row) for row in out)
-    dl0, dl1 = st.columns(2)
-    dl0.download_button("⬇ download history (CSV)", csv, "temperature_history.csv",
-                        "text/csv")
-    if is_comsol:
-        conv_hdr = ("# times = " + " ".join(f"{x:g}" for x in times) +
-                    "\n# radius_um, T[K] per time (µs); converted from COMSOL line graph")
-        prof = np.column_stack([r*1e6, T_cols])
-        conv = conv_hdr + "\n" + "\n".join(
-            ",".join(f"{v:.6g}" for v in row) for row in prof)
-        dl1.download_button("⬇ download converted app CSV", conv,
-                            "converted_series.csv", "text/csv",
-                            help="the COMSOL profiles in the app's reusable CSV format")
-
-
+    out = np.column_stack([sim["t_bin"], sim["T_peak"], sim["T_gauss"], sim["T_app"],
+                           sim["T_app_tab"], sim["T_edge"], np.array(sim["sigma"])*1e6])
+    csv = ("time_us,T_peak_K,T_gauss_K,T_app_K,T_app_lookup_K,T_edge_K,sigma_um\n"
+           + "\n".join(",".join(f"{v:.6g}" for v in row) for row in out))
+    st.download_button("⬇ download simulated history (CSV)", csv,
+                       "simulated_sop_history.csv", "text/csv")
 # ============================================================ TAB 2: SINGLE PROFILE
 with tab_prof:
     st.subheader("Single radial profile → forward evaluation")
     c0, c1 = st.columns([2, 1])
     with c0:
-        pbytes, pname = data_source(os.path.join(HERE, "sample_Tprofile.csv"),
+        pbytes, pname = data_source(os.path.join(HERE, "synthetic_temperatures", "sample_Tprofile.csv"),
                                     "Upload a T(r) profile (radius[µm], T[K])", key="pf")
     with c1:
         full = st.checkbox("use full profile (no pinhole cut)", value=False, key="pf_full")
@@ -533,7 +641,7 @@ with tab_spec:
 
     u0, u1, u2, u3 = st.columns([2, 1, 1, 1])
     with u0:
-        xbytes, xname = data_source(os.path.join(HERE, "sample_spectrum.csv"),
+        xbytes, xname = data_source(os.path.join(HERE, "synthetic_temperatures", "sample_spectrum.csv"),
                                     "Upload spectrum (2 columns: wavelength, intensity)",
                                     key="sp_f")
     lam_unit = u1.selectbox("wavelength unit", ["nm", "µm", "m", "Å"], index=0, key="sp_u")
@@ -682,3 +790,165 @@ with tab_spec:
     st.download_button("⬇ download inferred T(r) (CSV)", csv, "inferred_profile.csv",
                        "text/csv",
                        help="two-column profile — reusable in the Single profile tab")
+
+
+# ============================================================ TAB 3: EXPERIMENTAL SPECTRA
+with tab_exp:
+    st.subheader("3 · Experimental emission spectra → apparent T vs time")
+    st.markdown(
+        "Upload a **wide spectra file**: column 0 = wavelength [nm], each further column "
+        "= measured intensity at one time, with the times in a `# times = …` comment. "
+        "A Planck (free amplitude + temperature) is fitted to every column over the "
+        "spectrometer window.")
+
+    e0, e1 = st.columns([3, 1])
+    with e0:
+        ebytes, ename = data_source(os.path.join(HERE, "synthetic_spectrums", "sample_spectra_series.csv"),
+                                    "Upload experimental spectra (wide format)",
+                                    key="exp_f")
+    if ebytes is None:
+        st.stop()
+    with e1:
+        elabel = st.text_input("time unit label", "µs", key="exp_u")
+
+    try:
+        with st.spinner("fitting Planck to each spectrum…"):
+            ex = _fit_spectra_series(ebytes, ename, lo, hi)
+    except Exception as exc:
+        st.error(f"could not process this file: {exc}"); st.stop()
+
+    st.session_state["exp_result"] = dict(t=ex["times"], T_app=ex["T_app"],
+                                          A_app=ex["A_app"], name=str(ename))
+    good = np.isfinite(ex["T_app"])
+    em = st.columns(5)
+    em[0].metric("spectra", f"{ex['I'].shape[1]}")
+    em[1].metric("fitted", f"{int(good.sum())}")
+    em[2].metric("points in window", f"{int(ex['mask'].sum())}")
+    em[3].metric("median apparent T", f"{np.nanmedian(ex['T_app']):.0f} K")
+    em[4].metric("T range", f"{np.nanmin(ex['T_app']):.0f} – {np.nanmax(ex['T_app']):.0f} K")
+
+    st.markdown("#### Measured spectrogram")
+    fig, ax = plt.subplots(figsize=(11, 3.6))
+    pm = ax.pcolormesh(ex["times"], ex["lam"]*1e9, ex["I"], shading="auto", cmap="inferno")
+    fig.colorbar(pm, ax=ax, label="intensity (a.u.)")
+    ax.axhline(lo*1e9, color="cyan", ls="--", lw=1)
+    ax.axhline(hi*1e9, color="cyan", ls="--", lw=1)
+    ax.set_xlabel(f"time ({elabel})"); ax.set_ylabel("wavelength (nm)"); ax.invert_yaxis()
+    st.pyplot(fig, use_container_width=True)
+
+    x0, x1 = st.columns(2)
+    with x0:
+        st.markdown("#### Apparent temperature")
+        fig, ax = plt.subplots(figsize=(6, 4.0))
+        ax.plot(ex["times"][good], ex["T_app"][good], "o-", color="crimson", ms=3, lw=1.2)
+        ax.axhline(np.nanmedian(ex["T_app"]), color="k", ls=":", lw=1,
+                   label=f"median {np.nanmedian(ex['T_app']):.0f} K")
+        ax.set_xlabel(f"time ({elabel})"); ax.set_ylabel("apparent $T$ (K)")
+        ax.legend(fontsize=8); ax.grid(alpha=.25)
+        st.pyplot(fig, use_container_width=True)
+    with x1:
+        st.markdown("#### Fitted amplitude / emissivity")
+        fig, ax = plt.subplots(figsize=(6, 4.0))
+        ax.plot(ex["times"][good], ex["A_app"][good], "o-", color="seagreen", ms=3, lw=1.2)
+        ax.set_yscale("log")
+        ax.set_xlabel(f"time ({elabel})"); ax.set_ylabel("fitted amplitude (a.u.)")
+        ax.grid(alpha=.25, which="both")
+        st.pyplot(fig, use_container_width=True)
+
+    st.markdown("#### Spectrum inspector")
+    je = st.slider("spectrum", 0, ex["I"].shape[1]-1,
+                   int(np.nanargmax(np.where(good, ex["T_app"], -np.inf))), key="exp_j")
+    fig, ax = plt.subplots(figsize=(11, 3.4))
+    ax.plot(ex["lam"]*1e9, ex["I"][:, je], "-", color="0.6", lw=1, label="measured (all)")
+    ax.plot(ex["lam"][ex["mask"]]*1e9, ex["I"][ex["mask"], je], "k-", lw=1.8,
+            label="fit window")
+    if np.isfinite(ex["T_app"][je]):
+        ax.plot(ex["lam"][ex["mask"]]*1e9,
+                planck(ex["lam"][ex["mask"]], ex["T_app"][je], ex["A_app"][je]),
+                "r--", lw=1.6, label=f"Planck fit {ex['T_app'][je]:.0f} K")
+    ax.axvspan(lo*1e9, hi*1e9, color="orange", alpha=.15)
+    ax.set_xlabel("wavelength (nm)"); ax.set_ylabel("intensity (a.u.)")
+    ax.set_title(f"t = {ex['times'][je]:g} {elabel}")
+    ax.legend(fontsize=8); ax.grid(alpha=.25)
+    st.pyplot(fig, use_container_width=True)
+
+    csv = ("time,T_app_K,amplitude\n" + "\n".join(
+        ",".join(f"{v:.6g}" for v in row)
+        for row in np.column_stack([ex["times"], ex["T_app"], ex["A_app"]])))
+    st.download_button("⬇ download experimental apparent T (CSV)", csv,
+                       "experimental_apparent_T.csv", "text/csv")
+
+
+# ============================================================ TAB 4: COMPARE
+with tab_cmp:
+    st.subheader("4 · Simulation vs experiment")
+    sim_r = st.session_state.get("sim_result")
+    exp_r = st.session_state.get("exp_result")
+    if sim_r is None or exp_r is None:
+        missing = []
+        if sim_r is None: missing.append("**tab 2** (simulated SOP)")
+        if exp_r is None: missing.append("**tab 3** (experimental spectra)")
+        st.info("Run " + " and ".join(missing) + " first — their results are compared here.")
+    else:
+        st.caption(f"simulation: `{sim_r['name']}`  ·  experiment: `{exp_r['name']}`")
+        d0, d1, d2 = st.columns(3)
+        delay = d0.number_input("shift experiment by [time units]", -1e5, 1e5, 0.0,
+                                step=0.1, format="%.4f", key="cmp_d")
+        show_peak = d1.checkbox("show simulated peak $T$", value=True, key="cmp_pk")
+        corr_exp = d2.checkbox("correct experiment → peak $T$", value=False, key="cmp_cor",
+                               help="apply the universal inversion to the experimental "
+                                    "apparent T using the simulation's R/σ")
+        te = np.asarray(exp_r["t"], float) + delay
+        Te = np.asarray(exp_r["T_app"], float)
+        tsm = np.asarray(sim_r["t"], float)
+        Tsm = np.asarray(sim_r["T_app"], float)
+
+        try:
+            t_min = max(np.nanmin(te), np.nanmin(tsm))
+            t_max = min(np.nanmax(te), np.nanmax(tsm))
+            if not (t_max > t_min):
+                raise ValueError("the two records do not overlap in time — adjust the shift")
+            gs = np.isfinite(tsm) & np.isfinite(Tsm)
+            sim_at_exp = np.interp(te, tsm[gs], Tsm[gs], left=np.nan, right=np.nan)
+            ok = np.isfinite(sim_at_exp) & np.isfinite(Te) & (te >= t_min) & (te <= t_max)
+            if ok.sum() < 2:
+                raise ValueError("fewer than 2 overlapping points")
+            resid = Te[ok] - sim_at_exp[ok]
+            chi2 = float(np.sum(resid**2))
+            r_p = float(np.corrcoef(Te[ok], sim_at_exp[ok])[0, 1])
+            k = st.columns(5)
+            k[0].metric("overlapping points", f"{int(ok.sum())}")
+            k[1].metric("mean Δ (exp − sim)", f"{resid.mean():+.0f} K")
+            k[2].metric("RMS Δ", f"{np.sqrt((resid**2).mean()):.0f} K")
+            k[3].metric("reduced χ²", f"{chi2/resid.size:.3e}")
+            k[4].metric("Pearson r / R²", f"{r_p:.3f} / {r_p**2:.3f}")
+        except Exception as exc:
+            st.warning(f"comparison statistics unavailable: {exc}")
+            ok = None
+
+        fig, ax = plt.subplots(figsize=(11.5, 4.6))
+        if show_peak:
+            ax.plot(tsm, sim_r["T_peak"], "-", color="k", lw=1.3, alpha=.65,
+                    label="simulated peak $T$")
+        ax.plot(tsm, Tsm, "-", color="steelblue", lw=2, label="simulated apparent $T$")
+        ax.plot(te, Te, "o", color="crimson", ms=3.5, label="experimental apparent $T$")
+        if corr_exp:
+            tabr = get_ratio_table(lo, hi)
+            ros = np.interp(te, tsm, sim_r["R_um"]*1e-6/np.asarray(sim_r["sigma"], float))
+            Tc = np.array([correct_temperature(t_, rr, lo, hi)
+                           if np.isfinite(t_) and np.isfinite(rr) and rr > 0 else np.nan
+                           for t_, rr in zip(Te, ros)])
+            ax.plot(te, Tc, "s", color="darkorange", ms=3.5,
+                    label="experiment corrected → peak $T$")
+        ax.set_xlabel("time"); ax.set_ylabel("temperature (K)")
+        ax.legend(fontsize=8.5, ncol=2); ax.grid(alpha=.25)
+        st.pyplot(fig, use_container_width=True)
+
+        if ok is not None and ok.any():
+            st.markdown("#### Residual (experiment − simulation)")
+            fig, ax = plt.subplots(figsize=(11.5, 2.8))
+            ax.plot(te[ok], resid, "o-", color="black", ms=3, lw=1)
+            ax.axhline(0, color="grey", ls=":", lw=.8)
+            ax.set_xlabel("time"); ax.set_ylabel(r"$\Delta T$ (K)")
+            ax.grid(alpha=.25)
+            st.pyplot(fig, use_container_width=True)
