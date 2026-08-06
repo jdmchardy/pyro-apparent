@@ -85,13 +85,20 @@ Bundled samples live in `synthetic_temperatures/` (radial profiles and series) a
 
 The lookup table is built once per spectrometer window (~3 s) and cached to disk.
 
+## Plots
+
+All figures are **Plotly**: drag to pan, scroll or box-select to zoom, double-click to
+reset, hover for values, and use the mode bar to download a PNG. `planck_plots.py`
+(matplotlib) is retained for the offline scripts.
+
 ## Repository layout
 
 | file | role |
 |---|---|
 | `streamlit_app.py` | the app (UI only) |
 | `planck_model.py` | physics engine (numpy/scipy; no plotting) |
-| `planck_plots.py` | shared matplotlib figures |
+| `plotly_plots.py` | interactive Plotly figures used by the app |
+| `planck_plots.py` | matplotlib figures (offline scripts) |
 | `requirements.txt`, `.streamlit/config.toml` | deployment |
 | `sample_*.csv` | example inputs |
 

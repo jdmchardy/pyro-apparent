@@ -23,10 +23,7 @@ import io
 import contextlib
 import tempfile
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib import colormaps
+from matplotlib import colormaps      # colour sampling only; all plots are Plotly
 import streamlit as st
 
 from planck_model import (spectrum, spectrum_from_profile, planck, fit_temperature,
@@ -37,7 +34,13 @@ from planck_model import (spectrum, spectrum_from_profile, planck, fit_temperatu
                           parse_comsol_line_graph, load_spectra_series,
                           resample_series_time, bin_columns, write_series_csv,
                           get_ratio_table, ratio_from_table, C2)
-from planck_plots import plot_comparison, plot_profile_eval
+import plotly_plots as pp
+
+# theme=None keeps our own colour scales/palette (Streamlit's theme would override them)
+PLOTLY = dict(use_container_width=True, theme=None,
+              config={"scrollZoom": True, "displaylogo": False,
+                      "modeBarButtonsToAdd": ["drawline", "eraseshape"],
+                      "toImageButtonOptions": {"scale": 2, "format": "png"}})
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 METHOD_LABEL = {"table": "lookup table", "gaussian": "analytic Gaussian",
@@ -249,16 +252,29 @@ def gauss_apparent(res, lam_lo, lam_hi):
     return float(g["T0"] * ratio_from_table(tab, g["R_over_sigma"], xi_g))
 
 
-def data_source(default_path, label, key):
+@st.cache_data(show_spinner=False)
+def _find_example(filename):
+    """Locate a bundled example by name anywhere under the app folder, so the samples
+    keep working however the example folders are reorganised."""
+    for root, dirs, files in os.walk(HERE):
+        dirs[:] = [d for d in dirs
+                   if not d.startswith(".") and d not in ("__pycache__",)]
+        if filename in files:
+            return os.path.join(root, filename)
+    return None
+
+
+def data_source(example_name, label, key):
     """File uploader. Nothing is loaded until the user uploads a file, or explicitly
     opts into the bundled example. Returns (bytes, name) or (None, None)."""
     up = st.file_uploader(label, type=["csv", "txt", "dat"], key=key)
     if up is not None:
         return up.getvalue(), up.name
-    name = os.path.basename(default_path)
-    if os.path.exists(default_path):
-        if st.checkbox(f"use the bundled example ({name})", value=False, key=key + "_ex"):
-            return _read_bytes(default_path), name
+    path = _find_example(example_name)
+    if path:
+        if st.checkbox(f"use the bundled example ({example_name})", value=False,
+                       key=key + "_ex"):
+            return _read_bytes(path), example_name
         st.info("Upload a file to begin — or tick the box to load the bundled example.")
     else:
         st.info("Upload a file to begin.")
@@ -310,8 +326,7 @@ with tab_imp, tab_body():
 
     i0, i1 = st.columns([2, 1])
     with i0:
-        ibytes, iname = data_source(os.path.join(HERE, "example_files",
-                                                 "COMSOL_radial_T_100pulses_20umFWHM.txt"),
+        ibytes, iname = data_source("COMSOL_radial_T_100pulses_20umFWHM.txt",
                                     "Upload COMSOL export (or an app CSV to inspect)",
                                     key="imp_f")
     with i1:
@@ -338,20 +353,16 @@ with tab_imp, tab_body():
     p0, p1 = st.columns(2)
     with p0:
         st.markdown("#### Radial profiles")
-        fig, ax = plt.subplots(figsize=(6, 4.0))
         idx = np.linspace(0, iT.shape[1]-1, min(8, iT.shape[1])).round().astype(int)
-        for c, k in zip(colormaps["inferno"](np.linspace(.1, .85, len(idx))), idx):
-            ax.plot(ir*1e6, iT[:, k], color=c, lw=1.5, label=f"{it[k]:g}")
-        ax.set_xlabel(r"$r$ (µm)"); ax.set_ylabel(r"$T(r)$ (K)")
-        ax.legend(fontsize=7, title="time (µs)", ncol=2); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+        cols_ = colormaps["inferno"](np.linspace(.1, .85, len(idx)))
+        tr = [dict(x=ir*1e6, y=iT[:, k], name=f"{it[k]:g} µs",
+                   color=f"rgb({c[0]*255:.0f},{c[1]*255:.0f},{c[2]*255:.0f})", width=1.8)
+              for c, k in zip(cols_, idx)]
+        st.plotly_chart(pp.lines(tr, "r (µm)", "T(r) (K)", height=380), **PLOTLY)
     with p1:
         st.markdown("#### $T(r,t)$ map")
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        pm = ax.pcolormesh(it, ir*1e6, iT, shading="auto", cmap="inferno")
-        fig.colorbar(pm, ax=ax, label="$T$ (K)")
-        ax.set_xlabel("time (µs)"); ax.set_ylabel(r"$r$ (µm)")
-        st.pyplot(fig, use_container_width=True)
+        st.plotly_chart(pp.heatmap(it, ir*1e6, iT, "time (µs)", "r (µm)", "T (K)",
+                                   height=380), **PLOTLY)
 
     conv = ("# times = " + " ".join(f"{x:g}" for x in it) +
             "\n# radius_um, T[K] per time (µs); converted from " + str(iname) +
@@ -387,7 +398,7 @@ with tab_sim, tab_body():
             st.caption("Using the series imported in tab 1. Untick to load a file instead.")
         else:
             sbytes, sname = data_source(
-                os.path.join(HERE, "synthetic_temperatures", "Tseries_diffusion.csv"),
+                "Tseries_diffusion.csv",
                 "Upload series CSV (from tab 1)", key="sim_f")
     with s1:
         sim_dt = st.number_input("Δt between steps [µs] (COMSOL only)", 1e-4, 1e4, 0.1,
@@ -434,43 +445,35 @@ with tab_sim, tab_body():
                 f"{np.nanmax(sim['T_app'])-np.nanmax(sim['T_peak']):+.0f} K")
 
     st.markdown("#### Simulated SOP spectrogram (binned)")
-    fig, ax = plt.subplots(figsize=(11, 3.8))
-    pm = ax.pcolormesh(sim["t_bin"], sim["lam"]*1e9, sim["spec_bin"],
-                       shading="auto", cmap="inferno")
-    fig.colorbar(pm, ax=ax, label="emission (a.u.)")
-    ax.set_xlabel("time (µs)"); ax.set_ylabel("wavelength (nm)"); ax.invert_yaxis()
-    st.pyplot(fig, use_container_width=True)
+    st.plotly_chart(pp.heatmap(sim["t_bin"], sim["lam"]*1e9, sim["spec_bin"],
+                               "time (µs)", "wavelength (nm)", "emission (a.u.)",
+                               height=360, reverse_y=True), **PLOTLY)
 
     a0, a1 = st.columns(2)
     with a0:
         st.markdown("#### Temperature history")
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        ax.plot(sim["t_bin"], sim["T_peak"], "-o", color="k", ms=3, lw=1.6,
-                label="peak $T$ (data)")
-        ax.plot(sim["t_bin"], sim["T_gauss"], "--", color="seagreen", lw=1.5,
-                label="fitted Gaussian peak $T_0$")
-        ax.plot(sim["t_bin"], sim["T_app"], "-", color="crimson", lw=1.8,
-                label="apparent $T$ (binned spectra)")
-        ax.plot(sim["t_bin"], sim["T_app_tab"], "-.", color="darkorange", lw=1.5,
-                label="apparent $T$ (Gaussian + lookup)")
-        ax.plot(sim["t_bin"], sim["T_edge"], ":", color="steelblue", lw=1.8,
-                label=f"$T$ at edge (R={R_um:g} µm)")
-        ax.set_xlabel("time (µs)"); ax.set_ylabel("temperature (K)")
-        ax.legend(fontsize=7.5, ncol=2); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+        tr = [dict(x=sim["t_bin"], y=sim["T_peak"], name="peak T (data)",
+                   color="black", width=1.8),
+              dict(x=sim["t_bin"], y=sim["T_gauss"], name="fitted Gaussian peak T₀",
+                   color="seagreen", width=1.6, dash="dash"),
+              dict(x=sim["t_bin"], y=sim["T_app"], name="apparent T (binned spectra)",
+                   color="crimson", width=2),
+              dict(x=sim["t_bin"], y=sim["T_app_tab"],
+                   name="apparent T (Gaussian + lookup)", color="darkorange",
+                   width=1.6, dash="dashdot"),
+              dict(x=sim["t_bin"], y=sim["T_edge"], name=f"T at edge (R={R_um:g} µm)",
+                   color="steelblue", width=1.8, dash="dot")]
+        st.plotly_chart(pp.lines(tr, "time (µs)", "temperature (K)", height=400),
+                        **PLOTLY)
     with a1:
         st.markdown("#### Fit geometry and bias")
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        ax.plot(sim["t_bin"], R/np.array(sim["sigma"]), color="purple", lw=1.7,
-                label=r"$R/\sigma$")
-        ax.set_xlabel("time (µs)"); ax.set_ylabel(r"$R/\sigma$", color="purple")
-        ax.tick_params(axis="y", labelcolor="purple"); ax.grid(alpha=.25)
-        ax2 = ax.twinx()
-        ax2.plot(sim["t_bin"], (np.array(sim["T_app"])/np.array(sim["T_peak"])-1)*100,
-                 color="crimson", lw=1.7)
-        ax2.set_ylabel("apparent-$T$ bias (%)", color="crimson")
-        ax2.tick_params(axis="y", labelcolor="crimson")
-        st.pyplot(fig, use_container_width=True)
+        tr = [dict(x=sim["t_bin"], y=R/np.array(sim["sigma"]), name="R/σ",
+                   color="purple", width=1.8),
+              dict(x=sim["t_bin"],
+                   y=(np.array(sim["T_app"])/np.array(sim["T_peak"])-1)*100,
+                   name="apparent-T bias (%)", color="crimson", width=1.8, y2=True)]
+        st.plotly_chart(pp.lines(tr, "time (µs)", "R/σ", height=400,
+                                 y2lab="apparent-T bias (%)"), **PLOTLY)
 
     st.markdown("#### Bin explorer")
     jb = st.slider("time bin", 0, len(sim["t_bin"])-1,
@@ -478,26 +481,26 @@ with tab_sim, tab_body():
     st.write(f"**t = {sim['t_bin'][jb]:g} µs**  ·  {sim['counts'][jb]} interpolated samples")
     b0, b1 = st.columns(2)
     with b0:
-        fig, ax = plt.subplots(figsize=(6, 3.8))
-        ax.axvspan(0, R_um, color="skyblue", alpha=.20, label="pinhole")
-        ax.plot(st_r*1e6, sim["prof_bin"][:, jb], "k-", lw=2, label="binned $T(r)$")
         sg, T0g = sim["sigma"][jb], sim["T_gauss"][jb]
-        ax.plot(st_r*1e6, T0g*np.exp(-(st_r**2)/(2*sg**2)), "--", color="seagreen",
-                lw=1.6, label=f"Gaussian fit ($\\sigma$={sg*1e6:.1f} µm)")
-        ax.axhline(sim["T_app"][jb], color="crimson", ls="--", lw=1.3,
-                   label=f"apparent {sim['T_app'][jb]:.0f} K")
-        ax.set_xlabel(r"$r$ (µm)"); ax.set_ylabel("$T$ (K)")
-        ax.legend(fontsize=7.5); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+        tr = [dict(x=st_r*1e6, y=sim["prof_bin"][:, jb], name="binned T(r)",
+                   color="black", width=2.2),
+              dict(x=st_r*1e6, y=T0g*np.exp(-(st_r**2)/(2*sg**2)),
+                   name=f"Gaussian fit (σ={sg*1e6:.1f} µm)", color="seagreen",
+                   width=1.8, dash="dash")]
+        st.plotly_chart(pp.lines(
+            tr, "r (µm)", "T (K)", height=360,
+            vrects=[(0, R_um, "skyblue", 0.20, "pinhole")],
+            hlines=[(sim["T_app"][jb], "crimson", "dash",
+                     f"apparent {sim['T_app'][jb]:.0f} K")]), **PLOTLY)
     with b1:
-        fig, ax = plt.subplots(figsize=(6, 3.8))
-        sp = sim["spec_bin"][:, jb]
-        ax.plot(sim["lam"]*1e9, sp, "k-", lw=2, label="binned spectrum")
-        ax.plot(sim["lam"]*1e9, planck(sim["lam"], sim["T_app"][jb], sim["A_app"][jb]),
-                "r--", lw=1.6, label=f"Planck fit {sim['T_app'][jb]:.0f} K")
-        ax.set_xlabel("wavelength (nm)"); ax.set_ylabel("emission (a.u.)")
-        ax.legend(fontsize=7.5); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+        tr = [dict(x=sim["lam"]*1e9, y=sim["spec_bin"][:, jb], name="binned spectrum",
+                   color="black", width=2.2),
+              dict(x=sim["lam"]*1e9,
+                   y=planck(sim["lam"], sim["T_app"][jb], sim["A_app"][jb]),
+                   name=f"Planck fit {sim['T_app'][jb]:.0f} K", color="crimson",
+                   width=1.8, dash="dash")]
+        st.plotly_chart(pp.lines(tr, "wavelength (nm)", "emission (a.u.)",
+                                 height=360), **PLOTLY)
 
     out = np.column_stack([sim["t_bin"], sim["T_peak"], sim["T_gauss"], sim["T_app"],
                            sim["T_app_tab"], sim["T_edge"], np.array(sim["sigma"])*1e6])
@@ -510,7 +513,7 @@ with tab_prof, tab_body():
     st.subheader("Single radial profile → forward evaluation")
     c0, c1 = st.columns([2, 1])
     with c0:
-        pbytes, pname = data_source(os.path.join(HERE, "synthetic_temperatures", "Tprofile.csv"),
+        pbytes, pname = data_source("near_Gaussian_Tprofile.csv",
                                     "Upload a T(r) profile (radius[µm], T[K])", key="pf")
     with c1:
         full = st.checkbox("use full profile (no pinhole cut)", value=False, key="pf_full")
@@ -529,10 +532,9 @@ with tab_prof, tab_body():
         mm[3].metric("universal recovered T0", f"{g.get('T0_universal', float('nan')):.0f} K",
                      f"{g.get('recover_err', float('nan')):+.0f} K vs peak")
         mm[4].metric("ξ", f"{res['xi']:.2f}")
-        fig = plt.figure(figsize=(11, 4.3))
-        plot_profile_eval(fig, res, lo, hi, t_app_gauss=gauss_apparent(res, lo, hi))
-        fig.tight_layout(rect=(0, 0, 1, 0.94))
-        st.pyplot(fig, use_container_width=True)
+        st.plotly_chart(pp.profile_eval(res, lo, hi,
+                                        t_app_gauss=gauss_apparent(res, lo, hi)),
+                        **PLOTLY)
         st.caption("Left: data (black), Gaussian fitted inside the pinhole (green), pinhole "
                    "shaded blue. Right: **collected spectrum** = numerical integral of the "
                    "data $T(r)$ (black); **best-fit single Planck** at $T_{app}$ (red); the "
@@ -561,25 +563,22 @@ with tab_uni, tab_body():
     cA, cB = st.columns(2)
     with cA:
         st.markdown("#### Universal master curve (saturated limit)")
-        fig, ax = plt.subplots(figsize=(6, 4.3))
         xg = np.linspace(1.2, 12, 300)
-        ax.plot(xg, (wien_saturated_ratio(xg)-1)*100, "r--", lw=1.6,
-                label=r"$\xi E_1(\xi)e^{\xi}-1$")
-        ax.plot([xi], [(wien_saturated_ratio(xi)-1)*100], "ko", ms=8,
-                label=f"this spot (ξ={xi:.2f})")
-        ax.set_xlabel(r"$\xi$"); ax.set_ylabel("saturated bias (%)")
-        ax.legend(fontsize=8); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+        tr = [dict(x=xg, y=(wien_saturated_ratio(xg)-1)*100,
+                   name="ξE₁(ξ)e^ξ − 1", color="crimson", width=1.8, dash="dash"),
+              dict(x=[xi], y=[(wien_saturated_ratio(xi)-1)*100], mode="markers",
+                   name=f"this spot (ξ={xi:.2f})", color="black", size=11, mlw=1)]
+        st.plotly_chart(pp.lines(tr, "ξ", "saturated bias (%)", height=400), **PLOTLY)
     with cB:
         st.markdown("#### Lookup table $\\rho(R/\\sigma,\\xi)$")
-        fig, ax = plt.subplots(figsize=(6, 4.3))
-        pm = ax.pcolormesh(tab["xi"], tab["ros"], tab["rho"], shading="auto",
-                           cmap="viridis")
-        fig.colorbar(pm, ax=ax, label=r"$\rho=T_{\rm app}/T_0$")
-        ax.plot([xi], [ros], "o", color="crimson", ms=9, mec="w")
-        ax.set_xlabel(r"$\xi$"); ax.set_ylabel(r"$R/\sigma$")
-        ax.set_ylim(tab["ros"][0], min(tab["ros"][-1], max(3, ros*1.5)))
-        st.pyplot(fig, use_container_width=True)
+        figh = pp.heatmap(tab["xi"], tab["ros"], tab["rho"], "ξ", "R/σ",
+                          "ρ = T_app/T₀", height=400, cmap="Viridis",
+                          yrange=[tab["ros"][0], min(tab["ros"][-1], max(3, ros*1.5))])
+        figh.add_scatter(x=[xi], y=[ros], mode="markers", showlegend=False,
+                         marker=dict(color="crimson", size=13,
+                                     line=dict(color="white", width=2)),
+                         name="this spot")
+        st.plotly_chart(figh, **PLOTLY)
     st.caption("The lookup table (right) is the full surface; the master curve (left) is its "
                "$R/\\sigma\\to\\infty$ limit. The app corrects data by interpolating the table.")
 
@@ -607,10 +606,7 @@ with tab_batch, tab_body():
                                             R=rs*sg, fit_lo=lo, fit_hi=hi))
             with st.spinner(f"running {len(CONFIGS)} configs…"):
                 results = [run_config(cfg) for cfg in CONFIGS]
-            fig = plt.figure(figsize=(13, 9))
-            plot_comparison(fig, results, lo, hi)
-            fig.tight_layout(rect=(0, 0, 1, 0.97))
-            st.pyplot(fig, use_container_width=True)
+            st.plotly_chart(pp.comparison(results, lo, hi), **PLOTLY)
         except Exception as exc:
             st.error(f"could not run batch: {exc}")
 
@@ -672,7 +668,7 @@ with tab_spec, tab_body():
 
     u0, u1, u2, u3 = st.columns([2, 1, 1, 1])
     with u0:
-        xbytes, xname = data_source(os.path.join(HERE, "synthetic_temperatures", "SOP_spectrum.csv"),
+        xbytes, xname = data_source("SOP_spectrum.csv",
                                     "Upload spectrum (2 columns: wavelength, intensity)",
                                     key="sp_f")
     lam_unit = u1.selectbox("wavelength unit", ["nm", "µm", "m", "Å"], index=0, key="sp_u")
@@ -776,15 +772,16 @@ with tab_spec, tab_body():
     cA, cB = st.columns(2)
     with cA:
         st.markdown("#### Spectrum and Planck fit")
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        ax.plot(lam_all*1e9, I_all, "-", color="0.6", lw=1.0, label="measured (all)")
-        ax.plot(lam_all[m_fit]*1e9, I_all[m_fit], "k-", lw=2, label="fitted range")
-        ax.plot(lam_all[m_fit]*1e9, planck(lam_all[m_fit], T_app_sp, A_sp), "r--", lw=1.8,
-                label=f"Planck fit, $T_{{app}}$={T_app_sp:.0f} K")
-        ax.axvspan(lo*1e9, hi*1e9, color="orange", alpha=.18, label="fit window")
-        ax.set_xlabel("wavelength (nm)"); ax.set_ylabel("intensity (a.u.)")
-        ax.legend(fontsize=8); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+        tr = [dict(x=lam_all*1e9, y=I_all, name="measured (all)",
+                   color="rgb(150,150,150)", width=1.2),
+              dict(x=lam_all[m_fit]*1e9, y=I_all[m_fit], name="fitted range",
+                   color="black", width=2.2),
+              dict(x=lam_all[m_fit]*1e9, y=planck(lam_all[m_fit], T_app_sp, A_sp),
+                   name=f"Planck fit, T_app={T_app_sp:.0f} K", color="crimson",
+                   width=1.8, dash="dash")]
+        st.plotly_chart(pp.lines(tr, "wavelength (nm)", "intensity (a.u.)", height=400,
+                                 vrects=[(lo*1e9, hi*1e9, "orange", 0.18, "fit window")]),
+                        **PLOTLY)
 
         resid = 100*(planck(lam_all[m_fit], T_app_sp, A_sp)/I_all[m_fit] - 1)
         st.caption(f"fit residual: mean {resid.mean():+.2f} %, RMS {np.sqrt((resid**2).mean()):.2f} %")
@@ -795,21 +792,17 @@ with tab_spec, tab_body():
     T_of_r = T_peak_sp * np.exp(-r_plot**2 / (2*sig_m**2))
     with cB:
         st.markdown("#### Reconstructed radial temperature")
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        ax.axvspan(0, R_sp*1e6, color="skyblue", alpha=.20,
-                   label=f"pinhole ($R$={R_sp*1e6:.1f} µm)")
-        ax.axvline(R_sp*1e6, color="steelblue", ls=":", lw=1)
-        ax.plot(r_plot*1e6, T_of_r, "k-", lw=2, label="inferred $T(r)$")
-        ax.axhline(T_peak_sp, color="grey", ls=":", lw=1,
-                   label=f"peak {T_peak_sp:.0f} K")
-        ax.axhline(T_app_sp, color="crimson", ls="--", lw=1.4,
-                   label=f"apparent {T_app_sp:.0f} K")
-        ax.plot(R_sp*1e6, T_peak_sp*np.exp(-R_sp**2/(2*sig_m**2)), "o",
-                color="steelblue", ms=7,
-                label=f"edge {T_peak_sp*np.exp(-R_sp**2/(2*sig_m**2)):.0f} K")
-        ax.set_xlabel(r"$r$ (µm)"); ax.set_ylabel(r"$T(r)$ (K)")
-        ax.legend(fontsize=8); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+        T_edge_sp = T_peak_sp*np.exp(-R_sp**2/(2*sig_m**2))
+        tr = [dict(x=r_plot*1e6, y=T_of_r, name="inferred T(r)", color="black", width=2.2),
+              dict(x=[R_sp*1e6], y=[T_edge_sp], mode="markers",
+                   name=f"edge {T_edge_sp:.0f} K", color="steelblue", size=10)]
+        fig = pp.lines(tr, "r (µm)", "T(r) (K)", height=400,
+                       vrects=[(0, R_sp*1e6, "skyblue", 0.20,
+                                f"pinhole R={R_sp*1e6:.1f} µm")],
+                       hlines=[(T_peak_sp, "grey", "dot", f"peak {T_peak_sp:.0f} K"),
+                               (T_app_sp, "crimson", "dash",
+                                f"apparent {T_app_sp:.0f} K")])
+        st.plotly_chart(fig, **PLOTLY)
         if mode == "assume saturated":
             st.caption("σ is assumed for display only — the width is not constrained by "
                        "the spectrum. $T_{peak}$ above **is** determined.")
@@ -834,8 +827,7 @@ with tab_exp, tab_body():
 
     e0, e1 = st.columns([3, 1])
     with e0:
-        ebytes, ename = data_source(os.path.join(HERE, "example_files",
-                                                 "experimental_SOP_spectra_100pulses.csv"),
+        ebytes, ename = data_source("experimental_SOP_spectra_100pulses.csv",
                                     "Upload experimental spectra (wide format)",
                                     key="exp_f")
     if ebytes is None:
@@ -860,49 +852,43 @@ with tab_exp, tab_body():
     em[4].metric("T range", f"{np.nanmin(ex['T_app']):.0f} – {np.nanmax(ex['T_app']):.0f} K")
 
     st.markdown("#### Measured spectrogram")
-    fig, ax = plt.subplots(figsize=(11, 3.6))
-    pm = ax.pcolormesh(ex["times"], ex["lam"]*1e9, ex["I"], shading="auto", cmap="inferno")
-    fig.colorbar(pm, ax=ax, label="intensity (a.u.)")
-    ax.axhline(lo*1e9, color="cyan", ls="--", lw=1)
-    ax.axhline(hi*1e9, color="cyan", ls="--", lw=1)
-    ax.set_xlabel(f"time ({elabel})"); ax.set_ylabel("wavelength (nm)"); ax.invert_yaxis()
-    st.pyplot(fig, use_container_width=True)
+    st.plotly_chart(pp.heatmap(ex["times"], ex["lam"]*1e9, ex["I"],
+                               f"time ({elabel})", "wavelength (nm)", "intensity (a.u.)",
+                               height=360, reverse_y=True,
+                               hlines=[(lo*1e9, "cyan", "window"), (hi*1e9, "cyan")]),
+                    **PLOTLY)
 
     x0, x1 = st.columns(2)
     with x0:
         st.markdown("#### Apparent temperature")
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(ex["times"][good], ex["T_app"][good], "o-", color="crimson", ms=3, lw=1.2)
-        ax.axhline(np.nanmedian(ex["T_app"]), color="k", ls=":", lw=1,
-                   label=f"median {np.nanmedian(ex['T_app']):.0f} K")
-        ax.set_xlabel(f"time ({elabel})"); ax.set_ylabel("apparent $T$ (K)")
-        ax.legend(fontsize=8); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+        tr = [dict(x=ex["times"][good], y=ex["T_app"][good], name="apparent T",
+                   mode="lines+markers", color="crimson", width=1.4, size=5)]
+        st.plotly_chart(pp.lines(
+            tr, f"time ({elabel})", "apparent T (K)", height=380,
+            hlines=[(np.nanmedian(ex["T_app"]), "black", "dot",
+                     f"median {np.nanmedian(ex['T_app']):.0f} K")]), **PLOTLY)
     with x1:
         st.markdown("#### Fitted amplitude / emissivity")
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(ex["times"][good], ex["A_app"][good], "o-", color="seagreen", ms=3, lw=1.2)
-        ax.set_yscale("log")
-        ax.set_xlabel(f"time ({elabel})"); ax.set_ylabel("fitted amplitude (a.u.)")
-        ax.grid(alpha=.25, which="both")
-        st.pyplot(fig, use_container_width=True)
+        tr = [dict(x=ex["times"][good], y=ex["A_app"][good], name="fitted amplitude",
+                   mode="lines+markers", color="seagreen", width=1.4, size=5)]
+        st.plotly_chart(pp.lines(tr, f"time ({elabel})", "fitted amplitude (a.u.)",
+                                 height=380, ylog=True), **PLOTLY)
 
     st.markdown("#### Spectrum inspector")
     je = st.slider("spectrum", 0, ex["I"].shape[1]-1,
                    int(np.nanargmax(np.where(good, ex["T_app"], -np.inf))), key="exp_j")
-    fig, ax = plt.subplots(figsize=(11, 3.4))
-    ax.plot(ex["lam"]*1e9, ex["I"][:, je], "-", color="0.6", lw=1, label="measured (all)")
-    ax.plot(ex["lam"][ex["mask"]]*1e9, ex["I"][ex["mask"], je], "k-", lw=1.8,
-            label="fit window")
+    tr = [dict(x=ex["lam"]*1e9, y=ex["I"][:, je], name="measured (all)",
+               color="rgb(150,150,150)", width=1.2),
+          dict(x=ex["lam"][ex["mask"]]*1e9, y=ex["I"][ex["mask"], je],
+               name="fit window", color="black", width=2)]
     if np.isfinite(ex["T_app"][je]):
-        ax.plot(ex["lam"][ex["mask"]]*1e9,
-                planck(ex["lam"][ex["mask"]], ex["T_app"][je], ex["A_app"][je]),
-                "r--", lw=1.6, label=f"Planck fit {ex['T_app'][je]:.0f} K")
-    ax.axvspan(lo*1e9, hi*1e9, color="orange", alpha=.15)
-    ax.set_xlabel("wavelength (nm)"); ax.set_ylabel("intensity (a.u.)")
-    ax.set_title(f"t = {ex['times'][je]:g} {elabel}")
-    ax.legend(fontsize=8); ax.grid(alpha=.25)
-    st.pyplot(fig, use_container_width=True)
+        tr.append(dict(x=ex["lam"][ex["mask"]]*1e9,
+                       y=planck(ex["lam"][ex["mask"]], ex["T_app"][je], ex["A_app"][je]),
+                       name=f"Planck fit {ex['T_app'][je]:.0f} K", color="crimson",
+                       width=1.8, dash="dash"))
+    st.plotly_chart(pp.lines(tr, "wavelength (nm)", "intensity (a.u.)",
+                             title=f"t = {ex['times'][je]:g} {elabel}", height=340,
+                             vrects=[(lo*1e9, hi*1e9, "orange", 0.15)]), **PLOTLY)
 
     csv = ("time,T_app_K,amplitude\n" + "\n".join(
         ",".join(f"{v:.6g}" for v in row)
@@ -958,29 +944,26 @@ with tab_cmp, tab_body():
             st.warning(f"comparison statistics unavailable: {exc}")
             ok = None
 
-        fig, ax = plt.subplots(figsize=(11.5, 4.6))
+        tr = []
         if show_peak:
-            ax.plot(tsm, sim_r["T_peak"], "-", color="k", lw=1.3, alpha=.65,
-                    label="simulated peak $T$")
-        ax.plot(tsm, Tsm, "-", color="steelblue", lw=2, label="simulated apparent $T$")
-        ax.plot(te, Te, "o", color="crimson", ms=3.5, label="experimental apparent $T$")
+            tr.append(dict(x=tsm, y=sim_r["T_peak"], name="simulated peak T",
+                           color="black", width=1.4, opacity=0.7))
+        tr.append(dict(x=tsm, y=Tsm, name="simulated apparent T",
+                       color="steelblue", width=2.2))
+        tr.append(dict(x=te, y=Te, name="experimental apparent T", mode="markers",
+                       color="crimson", size=6))
         if corr_exp:
-            tabr = get_ratio_table(lo, hi)
             ros = np.interp(te, tsm, sim_r["R_um"]*1e-6/np.asarray(sim_r["sigma"], float))
             Tc = np.array([correct_temperature(t_, rr, lo, hi)
                            if np.isfinite(t_) and np.isfinite(rr) and rr > 0 else np.nan
                            for t_, rr in zip(Te, ros)])
-            ax.plot(te, Tc, "s", color="darkorange", ms=3.5,
-                    label="experiment corrected → peak $T$")
-        ax.set_xlabel("time"); ax.set_ylabel("temperature (K)")
-        ax.legend(fontsize=8.5, ncol=2); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
+            tr.append(dict(x=te, y=Tc, name="experiment corrected → peak T",
+                           mode="markers", color="darkorange", size=6))
+        st.plotly_chart(pp.lines(tr, "time", "temperature (K)", height=440), **PLOTLY)
 
         if ok is not None and ok.any():
             st.markdown("#### Residual (experiment − simulation)")
-            fig, ax = plt.subplots(figsize=(11.5, 2.8))
-            ax.plot(te[ok], resid, "o-", color="black", ms=3, lw=1)
-            ax.axhline(0, color="grey", ls=":", lw=.8)
-            ax.set_xlabel("time"); ax.set_ylabel(r"$\Delta T$ (K)")
-            ax.grid(alpha=.25)
-            st.pyplot(fig, use_container_width=True)
+            tr = [dict(x=te[ok], y=resid, name="ΔT", mode="lines+markers",
+                       color="black", width=1.2, size=5)]
+            st.plotly_chart(pp.lines(tr, "time", "ΔT (K)", height=280, legend=False,
+                                     hlines=[(0, "grey", "dot")]), **PLOTLY)
