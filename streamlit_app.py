@@ -3,15 +3,12 @@ Grey-body pyrometry of a Gaussian hot spot -- Streamlit app.
 
 Tabs:
   * Time series (main)   -- evaluate a sequence of radial T(r) snapshots.
-  * Synthetic SOP        -- streak-pyrometry spectrogram, gated apparent T, emissivity.
-  * Data comparison      -- synthetic SOP vs experimental temperatures / emission.
   * Single profile       -- one snapshot: apparent T, spectrum, Gaussian comparison.
   * Gaussian & universal -- explore the analytic model, master curve, lookup table.
   * Universality (batch) -- collapse of the bias across (T0, sigma) families.
   * About / theory       -- what the app computes and how.
 
-Physics: planck_model.py (Gaussian/universal) and sop_model.py (synthetic SOP);
-shared figures in planck_plots.py.
+All physics is in planck_model.py; shared figures in planck_plots.py.
 Run locally:   streamlit run streamlit_app.py
 """
 import os
@@ -32,10 +29,6 @@ from planck_model import (spectrum, spectrum_from_profile, planck, fit_temperatu
                           parse_comsol_line_graph,
                           get_ratio_table, ratio_from_table, C2)
 from planck_plots import plot_comparison, plot_profile_eval
-from sop_model import (apply_pinhole, resample_profiles, synthetic_spectrogram,
-                       total_emission, gated_apparent_temperature,
-                       fit_spectra_vs_time, compare_series, optimal_scale_chi2,
-                       planck_TA, fit_planck_TA)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 METHOD_LABEL = {"table": "lookup table", "gaussian": "analytic Gaussian",
@@ -105,40 +98,6 @@ def _eval_snapshot(file_bytes, name, j, R, lo, hi, dt_us):
     return evaluate_profile(r, T[:, j], lo, hi, R=R)
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
-def _run_sop(file_bytes, name, dt_us, r_max_um, gate_us, resample_us,
-             lam_lo_nm, lam_hi_nm, n_lam, area_factor):
-    """Full synthetic-SOP pipeline for a loaded radial series (cached)."""
-    times_file, r, T_cols = _series_arrays(file_bytes, name, dt_us)
-    t_s = np.asarray(times_file, float) * 1e-6          # file times are in µs
-    r_cut, T_cut = apply_pinhole(r, T_cols, r_max_um * 1e-6)
-    step = resample_us * 1e-6
-    t_new = np.arange(t_s.min(), t_s.max(), step) if step > 0 else t_s
-    T_new = resample_profiles(r_cut, t_s, T_cut, t_new) if step > 0 else T_cut
-    lambds = np.linspace(lam_lo_nm * 1e-9, lam_hi_nm * 1e-9, int(n_lam))
-    spectro = synthetic_spectrogram(r_cut, T_new, lambds, area_factor=area_factor)
-    emission = total_emission(spectro, lambds)
-    t_mid, T_app, A_app = gated_apparent_temperature(t_new, spectro, lambds,
-                                                     gate=gate_us * 1e-6)
-    T_vs_t, A_vs_t = fit_spectra_vs_time(lambds, spectro)
-    T_peak = np.nanmax(T_new, axis=0)
-    return dict(t=t_new, r=r_cut, T=T_new, lambds=lambds, spectro=spectro,
-                emission=emission, t_mid=t_mid, T_app=T_app, A_app=A_app,
-                T_vs_t=T_vs_t, A_vs_t=A_vs_t, T_peak=T_peak)
-
-
-def _read_xy(file_bytes, name, x_col, y_col, x_scale):
-    """Load a 2-column experimental file from uploaded bytes -> (time, value)."""
-    suffix = os.path.splitext(name)[1] or ".txt"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(file_bytes); path = f.name
-    try:
-        d = np.atleast_2d(np.loadtxt(path))
-    finally:
-        os.unlink(path)
-    return d[:, x_col] * x_scale, d[:, y_col]
-
-
 def gauss_apparent(res, lam_lo, lam_hi):
     """Apparent T under the Gaussian assumption, via the lookup table:
     T0_fit * rho(R/sigma, xi).  Returns None if no Gaussian fit is available."""
@@ -178,9 +137,9 @@ lam_c = float(np.sqrt(lo * hi))
 st.sidebar.caption(f"$\\lambda_c=\\sqrt{{\\lambda_1\\lambda_2}}$ = {lam_c*1e9:.0f} nm  ·  "
                    f"$c_2/\\lambda_c$ = {C2/lam_c:.0f} K (so $\\xi=${C2/lam_c:.0f}$/T_0$)")
 
-(tab_ts, tab_sop, tab_cmp, tab_prof, tab_uni, tab_batch, tab_about) = st.tabs(
-    ["⏱ Time series", "🔬 Synthetic SOP", "📊 Data comparison", "📈 Single profile",
-     "🎯 Gaussian & universal", "🌐 Universality (batch)", "📖 About / theory"])
+tab_ts, tab_prof, tab_uni, tab_batch, tab_about = st.tabs(
+    ["⏱ Time series", "📈 Single profile", "🎯 Gaussian & universal",
+     "🌐 Universality (batch)", "📖 About / theory"])
 
 
 # ============================================================ TAB 1: TIME SERIES
@@ -220,11 +179,16 @@ with tab_ts:
                  "replace with a time-labelled export later and it will be read automatically.")
 
     R = R_um * 1e-6
-    times, r, T_cols = _series_arrays(fbytes, fname, dt_us)
-    n_t = T_cols.shape[1]
-    with st.spinner("evaluating series…"):
-        s = _eval_series(fbytes, fname, R, method, lo, hi, dt_us)
-        s_num = s if method == "numerical" else _eval_series(fbytes, fname, R, "numerical", lo, hi, dt_us)
+    try:
+        times, r, T_cols = _series_arrays(fbytes, fname, dt_us)
+        n_t = T_cols.shape[1]
+        with st.spinner("evaluating series…"):
+            s = _eval_series(fbytes, fname, R, method, lo, hi, dt_us)
+            s_num = s if method == "numerical" else _eval_series(
+                fbytes, fname, R, "numerical", lo, hi, dt_us)
+    except Exception as exc:
+        st.error(f"could not read this file: {exc}")
+        st.stop()
 
     # ---- headline metrics (bias/apparent are always the true numerical fit) ----
     jpk = int(np.nanargmax(s_num["T_peak"]))
@@ -503,245 +467,3 @@ The Gaussian approximation is reliable when the *pinhole-region* profile is Gaus
 predicted-vs-true apparent-temperature gap gauges any departure.
 """)
     st.caption("Engine: planck_model.py · figures: planck_plots.py · UI: streamlit_app.py")
-
-
-# ============================================================ TAB: SYNTHETIC SOP
-with tab_sop:
-    st.subheader("Synthetic streak-optical-pyrometry (SOP)")
-    st.markdown(
-        "Build the emission a streak pyrometer would record from a radial $T(r,t)$ "
-        "series: annulus-weighted Planck emission through a synthetic pinhole, "
-        "gate-averaged and fitted for **apparent temperature** and **emissivity**.")
-
-    s0, s1, s2 = st.columns([2, 1, 1])
-    with s0:
-        sbytes, sname = data_source(os.path.join(HERE, "sample_Tseries_diffusion.csv"),
-                                    "Upload radial series (app CSV or COMSOL .txt)",
-                                    key="sop_f")
-    if sbytes is None:
-        st.stop()
-    sop_is_comsol = _is_comsol(sbytes)
-    with s1:
-        sop_dt_us = st.number_input("COMSOL Δt between steps [µs]", 1e-4, 1e4, 0.1,
-                                    step=0.1, format="%.4f", key="sop_dt",
-                                    disabled=not sop_is_comsol,
-                                    help="only used for COMSOL files without times")
-    with s2:
-        r_max_um = st.number_input("pinhole radius r_max [µm]", 0.5, 500.0, 20.0,
-                                   step=1.0, key="sop_rmax")
-
-    d0, d1, d2, d3 = st.columns(4)
-    resample_us = d0.number_input("detector time step [µs]", 0.0, 100.0, 0.0415,
-                                  step=0.005, format="%.4f", key="sop_res",
-                                  help="resample the profiles onto the detector time "
-                                       "base; 0 = keep the file's own times")
-    gate_us = d1.number_input("gate / integration time [µs]", 0.001, 100.0, 0.083,
-                              step=0.01, format="%.4f", key="sop_gate",
-                              help="spectra are averaged over this window before "
-                                   "fitting (notebook uses 2 × the time step)")
-    lam1 = d2.number_input("SOP λ low [nm]", 200.0, 5000.0, 575.0, step=25.0, key="sop_l1")
-    lam2 = d3.number_input("SOP λ high [nm]", 200.0, 5000.0, 775.0, step=25.0, key="sop_l2")
-
-    e0, e1 = st.columns([1, 3])
-    n_lam = e0.select_slider("wavelength points", [100, 200, 500, 1000], value=500,
-                             key="sop_nlam")
-    area_factor = 2.0 if e1.checkbox(
-        "use the notebook's 2π ring weight (else true annulus area π)", value=True,
-        key="sop_af") else 1.0
-
-    if lam1 >= lam2:
-        st.error("λ low must be < λ high"); st.stop()
-
-    with st.spinner("building synthetic SOP…"):
-        sop = _run_sop(sbytes, sname, sop_dt_us, r_max_um, gate_us, resample_us,
-                       lam1, lam2, n_lam, area_factor)
-    st.session_state["sop_result"] = dict(
-        t_mid_us=sop["t_mid"] * 1e6, T_app=sop["T_app"],
-        t_us=sop["t"] * 1e6, emission=sop["emission"], T_peak=sop["T_peak"])
-
-    tt = sop["t"] * 1e6
-    jpk = int(np.nanargmax(sop["T_peak"]))
-    valid = np.isfinite(sop["T_app"])
-    mm = st.columns(5)
-    mm[0].metric("time steps", f"{tt.size}")
-    mm[1].metric("gates fitted", f"{int(valid.sum())} / {sop['T_app'].size}")
-    mm[2].metric("max peak T", f"{np.nanmax(sop['T_peak']):.0f} K")
-    mm[3].metric("max apparent T", f"{np.nanmax(sop['T_app']):.0f} K" if valid.any() else "—")
-    if valid.any():
-        mm[4].metric("max $T_{peak}-T_{app}$",
-                     f"{np.nanmax(sop['T_peak']) - np.nanmax(sop['T_app']):.0f} K")
-
-    # ---- spectrogram ----
-    st.markdown("#### Synthetic SOP spectrogram")
-    fig, ax = plt.subplots(figsize=(11, 4.2))
-    pm = ax.pcolormesh(tt, sop["lambds"]*1e9, sop["spectro"], shading="auto",
-                       cmap="inferno")
-    fig.colorbar(pm, ax=ax, label="spectral emission (a.u.)")
-    ax.set_xlabel("time (µs)"); ax.set_ylabel("wavelength (nm)")
-    ax.invert_yaxis()
-    st.pyplot(fig, use_container_width=True)
-
-    # ---- total emission + apparent T ----
-    cA, cB = st.columns(2)
-    with cA:
-        st.markdown("#### Total emission vs time")
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        emax = np.nanmax(sop["emission"])
-        ax.plot(tt, sop["emission"]/emax if emax > 0 else sop["emission"],
-                color="darkorange", lw=1.8)
-        ax.set_xlabel("time (µs)"); ax.set_ylabel("normalised total emission")
-        ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
-    with cB:
-        st.markdown("#### Apparent vs peak temperature")
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(tt, sop["T_peak"], "-", color="k", lw=1.8, label="peak $T$ (data)")
-        ax.plot(tt, sop["T_vs_t"], "-", color="steelblue", lw=1.0, alpha=.7,
-                label="apparent $T$ (per step)")
-        ax.plot(sop["t_mid"]*1e6, sop["T_app"], "o", color="fuchsia", ms=4,
-                label=f"apparent $T$ (gated {gate_us:g} µs)")
-        ax.set_xlabel("time (µs)"); ax.set_ylabel("temperature (K)")
-        ax.legend(fontsize=8); ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
-
-    # ---- emissivity + delta ----
-    cC, cD = st.columns(2)
-    with cC:
-        st.markdown("#### Fitted emissivity / amplitude vs time")
-        fig, ax = plt.subplots(figsize=(6, 3.8))
-        ax.plot(tt, sop["A_vs_t"], "o-", color="seagreen", ms=2.5, lw=1.2)
-        ax.set_xlabel("time (µs)"); ax.set_ylabel("fitted amplitude $A$ (a.u.)")
-        ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
-    with cD:
-        st.markdown("#### $T_{peak} - T_{app}$")
-        fig, ax = plt.subplots(figsize=(6, 3.8))
-        dT = sop["T_peak"] - sop["T_vs_t"]
-        ax.plot(tt, dT, "-", color="crimson", lw=1.6)
-        ax.axhline(0, color="grey", ls=":", lw=.8)
-        ax.set_xlabel("time (µs)"); ax.set_ylabel(r"$\Delta T$ (K)")
-        ax.grid(alpha=.25)
-        st.pyplot(fig, use_container_width=True)
-
-    # ---- spectra at selected times ----
-    st.markdown("#### Emission spectra and Planck fits")
-    jsel = st.slider("time step", 0, tt.size-1, min(jpk, tt.size-1), key="sop_j")
-    fig, ax = plt.subplots(figsize=(11, 3.6))
-    spec = sop["spectro"][:, jsel]
-    ax.plot(sop["lambds"]*1e9, spec, "k-", lw=2, label=f"synthetic spectrum @ {tt[jsel]:g} µs")
-    Tf, Af = sop["T_vs_t"][jsel], sop["A_vs_t"][jsel]
-    if np.isfinite(Tf):
-        ax.plot(sop["lambds"]*1e9, planck_TA(sop["lambds"], Tf, Af), "r--", lw=1.6,
-                label=f"Planck fit: $T$={Tf:.0f} K, $A$={Af:.2e}")
-    ax.set_xlabel("wavelength (nm)"); ax.set_ylabel("spectral emission (a.u.)")
-    ax.legend(fontsize=8); ax.grid(alpha=.25)
-    st.pyplot(fig, use_container_width=True)
-    q = st.columns(3)
-    q[0].metric("peak T at this step", f"{sop['T_peak'][jsel]:.0f} K")
-    q[1].metric("apparent T", f"{Tf:.0f} K" if np.isfinite(Tf) else "—")
-    q[2].metric("difference", f"{sop['T_peak'][jsel]-Tf:+.0f} K" if np.isfinite(Tf) else "—")
-
-    out = np.column_stack([sop["t_mid"]*1e6, sop["T_app"], sop["A_app"]])
-    csv = "time_us,T_apparent_K,amplitude\n" + "\n".join(
-        ",".join(f"{v:.6g}" for v in row) for row in out)
-    st.download_button("⬇ download gated apparent T (CSV)", csv,
-                       "synthetic_sop_apparent_T.csv", "text/csv")
-
-
-# ============================================================ TAB: DATA COMPARISON
-with tab_cmp:
-    st.subheader("Compare the synthetic SOP with experimental data")
-    sop_res = st.session_state.get("sop_result")
-    if sop_res is None:
-        st.info("Run the **🔬 Synthetic SOP** tab first — its result is compared here.")
-    else:
-        st.caption("Files are 2-column. The notebook's temperature files store "
-                   "(T, time[ns]); the integrated-emission files store "
-                   "(intensity, time[µs]).")
-        g0, g1, g2 = st.columns([2, 1, 1])
-        with g0:
-            up_T = st.file_uploader("experimental SOP temperatures",
-                                    type=["txt", "csv", "dat"], key="cmp_T")
-        t_unit = g1.selectbox("time column unit", ["ns", "µs", "s"], index=0, key="cmp_tu")
-        delay = g2.number_input("time delay [µs]", -1e4, 1e4, 28.65, step=0.05,
-                                key="cmp_delay",
-                                help="shift applied to the experimental time axis")
-        scale = {"ns": 1e-3, "µs": 1.0, "s": 1e6}[t_unit]
-
-        if up_T is not None:
-            try:
-                t_exp, T_exp = _read_xy(up_T.getvalue(), up_T.name, 1, 0, scale)
-                t_exp = t_exp + delay
-                stats = compare_series(t_exp, T_exp,
-                                       sop_res["t_mid_us"], sop_res["T_app"])
-                k = st.columns(5)
-                k[0].metric("overlapping points", f"{stats['n_points']}")
-                k[1].metric("χ²", f"{stats['chi2']:.3e}")
-                k[2].metric("reduced χ²", f"{stats['chi2_reduced']:.3e}")
-                k[3].metric("Pearson r", f"{stats['r']:.4f}")
-                k[4].metric("R²", f"{stats['r2']:.4f}")
-
-                fig, ax = plt.subplots(figsize=(11, 4.4))
-                ax.plot(t_exp, T_exp, "o", color="green", ms=4, label="experimental SOP")
-                ax.plot(sop_res["t_mid_us"], sop_res["T_app"], "o", color="fuchsia",
-                        ms=3, alpha=.7, label="synthetic apparent $T$")
-                ax.plot(stats["t_valid"], stats["T_interp_valid"], "r--", lw=1.8,
-                        label=f"synthetic interpolated (R²={stats['r2']:.3f})")
-                ax.plot(sop_res["t_us"], sop_res["T_peak"], "-", color="k", lw=1.2,
-                        alpha=.6, label="model peak $T$")
-                ax.set_xlabel("time (µs)"); ax.set_ylabel("temperature (K)")
-                ax.legend(fontsize=8, ncol=2); ax.grid(alpha=.25)
-                st.pyplot(fig, use_container_width=True)
-
-                st.markdown("#### Residuals (experiment − synthetic)")
-                fig, ax = plt.subplots(figsize=(11, 3.0))
-                ax.plot(stats["t_valid"], stats["residuals"], "o-", color="black",
-                        ms=3, lw=1.0)
-                ax.axhline(0, color="grey", ls=":", lw=.8)
-                ax.set_xlabel("time (µs)"); ax.set_ylabel(r"$\Delta T$ (K)")
-                ax.grid(alpha=.25)
-                st.pyplot(fig, use_container_width=True)
-            except Exception as exc:
-                st.error(f"temperature comparison failed: {exc}")
-
-        st.divider()
-        h0, h1, h2 = st.columns([2, 1, 1])
-        with h0:
-            up_I = st.file_uploader("experimental integrated emission",
-                                    type=["txt", "csv", "dat"], key="cmp_I")
-        i_unit = h1.selectbox("time column unit", ["µs", "ns", "s"], index=0, key="cmp_iu")
-        i_delay = h2.number_input("time delay [µs]", -1e4, 1e4, 28.65, step=0.05,
-                                  key="cmp_idelay")
-        iscale = {"ns": 1e-3, "µs": 1.0, "s": 1e6}[i_unit]
-
-        if up_I is not None:
-            try:
-                t_i, I_i = _read_xy(up_I.getvalue(), up_I.name, 1, 0, iscale)
-                t_i = t_i + i_delay
-                I_norm = I_i / np.nanmax(I_i)
-                mod_t, mod_e = sop_res["t_us"], sop_res["emission"]
-                mod_norm = mod_e / np.nanmax(mod_e)
-                m = (t_i >= mod_t.min()) & (t_i <= mod_t.max())
-                if m.sum() < 2:
-                    st.warning("experimental emission does not overlap the model times.")
-                else:
-                    mod_at_exp = np.interp(t_i[m], mod_t, mod_norm)
-                    sc = optimal_scale_chi2(I_norm[m], mod_at_exp)
-                    k = st.columns(4)
-                    k[0].metric("overlapping points", f"{sc['n_points']}")
-                    k[1].metric("optimal scale a", f"{sc['a_opt']:.3f}")
-                    k[2].metric("χ² (scaled)", f"{sc['chi2']:.3e}")
-                    k[3].metric("χ² (unscaled)", f"{sc['chi2_unscaled']:.3e}")
-
-                    fig, ax = plt.subplots(figsize=(11, 4.2))
-                    ax.plot(mod_t, mod_norm, "--", color="steelblue", lw=1.8,
-                            label="model emission (normalised)")
-                    ax.plot(t_i[m], sc["a_opt"]*mod_at_exp, "-", color="green", lw=2,
-                            label=f"model × {sc['a_opt']:.3f} (χ²={sc['chi2']:.2f})")
-                    ax.plot(t_i, I_norm, "-", color="crimson", lw=1.2, alpha=.8,
-                            label="experimental emission")
-                    ax.set_xlabel("time (µs)"); ax.set_ylabel("normalised emission (a.u.)")
-                    ax.legend(fontsize=8); ax.grid(alpha=.25)
-                    st.pyplot(fig, use_container_width=True)
-            except Exception as exc:
-                st.error(f"emission comparison failed: {exc}")

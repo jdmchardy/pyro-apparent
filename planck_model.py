@@ -391,10 +391,21 @@ def parse_comsol_line_graph(path, dt=None, times=None):
                     desc = line            # the R / Temperature column-descriptor line
             else:
                 break
+    # Guard: the point-probe export (Ttab_*) also starts with "% Model ... COMSOL" but
+    # has TIME in column 0, so it would silently parse as nonsense radii. Reject it.
+    if desc is not None and re.match(r"^\s*%?\s*Time\b", desc, re.I):
+        raise ValueError(
+            "this looks like a COMSOL point-probe export (column 0 is Time), not a 1-D "
+            "radial line graph. Upload the 'Radial_T_profile_*' file instead.")
+
     data = np.atleast_2d(np.loadtxt(path, comments="%"))
     if data.shape[1] < 2:
         raise ValueError("expected >= 2 columns (R + temperature snapshots)")
     r = data[:, 0].astype(float)
+    if np.any(r < 0) or r.max() > 1.0:
+        raise ValueError(
+            f"column 0 does not look like a radius in metres (max {r.max():.3g} m). "
+            "Is this a radial line-graph export?")
     T_cols = data[:, 1:].astype(float)
     n_t = T_cols.shape[1]
     t = None
