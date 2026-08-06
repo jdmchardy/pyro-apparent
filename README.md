@@ -29,6 +29,10 @@ streamlit run streamlit_app.py
   `T(r,t)` map, the collected emission spectra vs time, the fit-geometry/bias evolution,
   and a snapshot explorer showing each profile + Gaussian fit (pinhole shaded) and its
   collected spectrum. Downloadable results.
+- **🔭 Measured spectrum → T(r)** — upload an experimental emission spectrum, fit a Planck
+  over the spectrometer window to get the **apparent temperature**, give the **pinhole
+  diameter**, then invert the bias under the Gaussian assumption to recover the **true
+  peak temperature** and the radial profile. Downloadable inferred `T(r)`.
 - **📈 Single profile** — one snapshot: apparent T, collected spectrum, Gaussian fit, and
   the universal-corrected peak.
 - **🎯 Gaussian & universal** — slider explorer for `(T₀, σ, R)`; apparent T, bias, the
@@ -48,6 +52,9 @@ time. Put the times in a comment line:
 If the times line is absent, column indices are used. Comma or whitespace delimited.
 
 **Single profile** — two columns: radius [µm], `T` [K].
+
+**Measured spectrum** — two columns: wavelength, intensity (arb.). The wavelength unit
+(nm / µm / m / Å) and the column indices are selectable in the tab.
 
 Bundled samples: `sample_Tseries_diffusion.csv` (10 µm-FWHM beam + radial diffusion over
 100 µs), `sample_Tprofile.csv` (peaked), `near_Gaussian_Tprofile.csv`.

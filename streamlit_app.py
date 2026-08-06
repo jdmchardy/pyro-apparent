@@ -3,6 +3,7 @@ Grey-body pyrometry of a Gaussian hot spot -- Streamlit app.
 
 Tabs:
   * Time series (main)   -- evaluate a sequence of radial T(r) snapshots.
+  * Measured spectrum    -- fit an experimental spectrum, invert to peak T and T(r).
   * Single profile       -- one snapshot: apparent T, spectrum, Gaussian comparison.
   * Gaussian & universal -- explore the analytic model, master curve, lookup table.
   * Universality (batch) -- collapse of the bias across (T0, sigma) families.
@@ -98,6 +99,25 @@ def _eval_snapshot(file_bytes, name, j, R, lo, hi, dt_us):
     return evaluate_profile(r, T[:, j], lo, hi, R=R)
 
 
+@st.cache_data(show_spinner=False)
+def _read_xy(file_bytes, name, x_col, y_col, x_scale=1.0):
+    """Load a 2-column data file from uploaded bytes -> (x * x_scale, y)."""
+    suffix = os.path.splitext(name)[1] or ".csv"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(file_bytes); path = f.name
+    try:
+        try:
+            d = np.atleast_2d(np.loadtxt(path, delimiter=",", comments=("#", "%")))
+        except ValueError:
+            d = np.atleast_2d(np.loadtxt(path, comments=("#", "%")))
+    finally:
+        os.unlink(path)
+    if d.shape[1] <= max(x_col, y_col):
+        raise ValueError(f"file has {d.shape[1]} columns; "
+                         f"need columns {x_col} and {y_col}")
+    return d[:, x_col] * x_scale, d[:, y_col]
+
+
 def gauss_apparent(res, lam_lo, lam_hi):
     """Apparent T under the Gaussian assumption, via the lookup table:
     T0_fit * rho(R/sigma, xi).  Returns None if no Gaussian fit is available."""
@@ -137,9 +157,9 @@ lam_c = float(np.sqrt(lo * hi))
 st.sidebar.caption(f"$\\lambda_c=\\sqrt{{\\lambda_1\\lambda_2}}$ = {lam_c*1e9:.0f} nm  ·  "
                    f"$c_2/\\lambda_c$ = {C2/lam_c:.0f} K (so $\\xi=${C2/lam_c:.0f}$/T_0$)")
 
-tab_ts, tab_prof, tab_uni, tab_batch, tab_about = st.tabs(
-    ["⏱ Time series", "📈 Single profile", "🎯 Gaussian & universal",
-     "🌐 Universality (batch)", "📖 About / theory"])
+(tab_ts, tab_spec, tab_prof, tab_uni, tab_batch, tab_about) = st.tabs(
+    ["⏱ Time series", "🔭 Measured spectrum → T(r)", "📈 Single profile",
+     "🎯 Gaussian & universal", "🌐 Universality (batch)", "📖 About / theory"])
 
 
 # ============================================================ TAB 1: TIME SERIES
@@ -467,3 +487,127 @@ The Gaussian approximation is reliable when the *pinhole-region* profile is Gaus
 predicted-vs-true apparent-temperature gap gauges any departure.
 """)
     st.caption("Engine: planck_model.py · figures: planck_plots.py · UI: streamlit_app.py")
+
+
+# ============================================================ TAB: MEASURED SPECTRUM
+with tab_spec:
+    st.subheader("Measured emission spectrum → apparent T → radial $T(r)$")
+    st.markdown(
+        "Fit a measured spectrum over the spectrometer window to get the **apparent "
+        "temperature**, then invert the pinhole bias under the Gaussian assumption to "
+        "recover the **true peak temperature** and the radial profile.")
+
+    u0, u1, u2, u3 = st.columns([2, 1, 1, 1])
+    with u0:
+        xbytes, xname = data_source(os.path.join(HERE, "sample_spectrum.csv"),
+                                    "Upload spectrum (2 columns: wavelength, intensity)",
+                                    key="sp_f")
+    lam_unit = u1.selectbox("wavelength unit", ["nm", "µm", "m", "Å"], index=0, key="sp_u")
+    lam_col = u2.number_input("wavelength column", 0, 20, 0, step=1, key="sp_lc")
+    int_col = u3.number_input("intensity column", 0, 20, 1, step=1, key="sp_ic")
+    if xbytes is None:
+        st.stop()
+    uscale = {"nm": 1e-9, "µm": 1e-6, "m": 1.0, "Å": 1e-10}[lam_unit]
+
+    try:
+        lam_all, I_all = _read_xy(xbytes, xname, int(lam_col), int(int_col), uscale)
+        order = np.argsort(lam_all)
+        lam_all, I_all = lam_all[order], I_all[order]
+    except Exception as exc:
+        st.error(f"could not read the spectrum: {exc}"); st.stop()
+
+    m_fit = (lam_all >= lo) & (lam_all <= hi) & np.isfinite(I_all) & (I_all > 0)
+    if m_fit.sum() < 5:
+        st.error(f"only {int(m_fit.sum())} usable points inside the window "
+                 f"{lo*1e9:.0f}–{hi*1e9:.0f} nm (data spans "
+                 f"{lam_all.min()*1e9:.0f}–{lam_all.max()*1e9:.0f} nm). "
+                 "Adjust the window in the sidebar or check the wavelength unit.")
+        st.stop()
+
+    # ---- geometry ----
+    g0, g1, g2 = st.columns([1, 1, 2])
+    D_um = g0.number_input("pinhole diameter [µm]", 0.1, 1000.0, 30.0, step=1.0,
+                           key="sp_D", help="collection aperture; R = D/2")
+    R_sp = 0.5 * D_um * 1e-6
+    mode = g1.radio("spot width", ["assume saturated", "known σ"], key="sp_mode",
+                    help="T_app and R alone cannot fix both T_peak and σ — supply σ, "
+                         "or assume the pinhole is saturated (R/σ ≳ 1.5).")
+    if mode == "known σ":
+        sig_um = g2.number_input("Gaussian σ [µm] (from imaging)", 0.05, 500.0, 10.0,
+                                 step=0.5, key="sp_sig")
+        ros_sp = R_sp / (sig_um * 1e-6)
+        g2.caption(f"R/σ = {ros_sp:.2f}"
+                   + ("  ·  saturated" if ros_sp >= 1.5 else
+                      "  ·  **under-filled** — the bias still depends on R/σ"))
+    else:
+        ros_sp = 5.0            # deep in the saturated plateau: rho depends on xi only
+        g2.info("Saturated: only ξ matters, so $T_{peak}$ follows from $T_{app}$ alone. "
+                "σ is then **not** determined — it is only constrained to σ ≲ R/1.5. "
+                "Pick a σ below to draw a representative profile.")
+        sig_um = g2.number_input("σ for display only [µm]", 0.05, 500.0,
+                                 float(f"{R_sp*1e6/1.5:.2f}"), step=0.5, key="sp_sigd")
+
+    # ---- fit + invert ----
+    try:
+        T_app_sp, A_sp = fit_temperature(lam_all[m_fit], I_all[m_fit], T_guess=3000.0)
+        T_peak_sp, info = correct_temperature(T_app_sp, ros_sp, lo, hi, return_info=True)
+    except Exception as exc:
+        st.error(f"fit/inversion failed: {exc}"); st.stop()
+
+    k = st.columns(5)
+    k[0].metric("points fitted", f"{int(m_fit.sum())}")
+    k[1].metric("apparent T", f"{T_app_sp:.0f} K")
+    k[2].metric("recovered peak T", f"{T_peak_sp:.0f} K",
+                f"{T_peak_sp - T_app_sp:+.0f} K")
+    k[3].metric("correction ρ", f"{info['rho']:.3f}")
+    k[4].metric("ξ, R/σ", f"{info['xi']:.2f}, {ros_sp:.2f}")
+
+    # ---- spectrum + fit ----
+    cA, cB = st.columns(2)
+    with cA:
+        st.markdown("#### Spectrum and Planck fit")
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(lam_all*1e9, I_all, "-", color="0.6", lw=1.0, label="measured (all)")
+        ax.plot(lam_all[m_fit]*1e9, I_all[m_fit], "k-", lw=2, label="fitted range")
+        ax.plot(lam_all[m_fit]*1e9, planck(lam_all[m_fit], T_app_sp, A_sp), "r--", lw=1.8,
+                label=f"Planck fit, $T_{{app}}$={T_app_sp:.0f} K")
+        ax.axvspan(lo*1e9, hi*1e9, color="orange", alpha=.18, label="fit window")
+        ax.set_xlabel("wavelength (nm)"); ax.set_ylabel("intensity (a.u.)")
+        ax.legend(fontsize=8); ax.grid(alpha=.25)
+        st.pyplot(fig, use_container_width=True)
+
+        resid = 100*(planck(lam_all[m_fit], T_app_sp, A_sp)/I_all[m_fit] - 1)
+        st.caption(f"fit residual: mean {resid.mean():+.2f} %, RMS {np.sqrt((resid**2).mean()):.2f} %")
+
+    # ---- reconstructed radial profile ----
+    sig_m = sig_um * 1e-6
+    r_plot = np.linspace(0, max(R_sp*1.6, 3*sig_m), 400)
+    T_of_r = T_peak_sp * np.exp(-r_plot**2 / (2*sig_m**2))
+    with cB:
+        st.markdown("#### Reconstructed radial temperature")
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.axvspan(0, R_sp*1e6, color="skyblue", alpha=.20,
+                   label=f"pinhole ($R$={R_sp*1e6:.1f} µm)")
+        ax.axvline(R_sp*1e6, color="steelblue", ls=":", lw=1)
+        ax.plot(r_plot*1e6, T_of_r, "k-", lw=2, label="inferred $T(r)$")
+        ax.axhline(T_peak_sp, color="grey", ls=":", lw=1,
+                   label=f"peak {T_peak_sp:.0f} K")
+        ax.axhline(T_app_sp, color="crimson", ls="--", lw=1.4,
+                   label=f"apparent {T_app_sp:.0f} K")
+        ax.plot(R_sp*1e6, T_peak_sp*np.exp(-R_sp**2/(2*sig_m**2)), "o",
+                color="steelblue", ms=7,
+                label=f"edge {T_peak_sp*np.exp(-R_sp**2/(2*sig_m**2)):.0f} K")
+        ax.set_xlabel(r"$r$ (µm)"); ax.set_ylabel(r"$T(r)$ (K)")
+        ax.legend(fontsize=8); ax.grid(alpha=.25)
+        st.pyplot(fig, use_container_width=True)
+        if mode == "assume saturated":
+            st.caption("σ is assumed for display only — the width is not constrained by "
+                       "the spectrum. $T_{peak}$ above **is** determined.")
+
+    prof = np.column_stack([r_plot*1e6, T_of_r])
+    csv = ("# inferred Gaussian profile: T_peak=%.1f K, sigma=%.3f um, R=%.3f um\n"
+           "# radius_um, T_K\n" % (T_peak_sp, sig_um, R_sp*1e6)) + "\n".join(
+        ",".join(f"{v:.6g}" for v in row) for row in prof)
+    st.download_button("⬇ download inferred T(r) (CSV)", csv, "inferred_profile.csv",
+                       "text/csv",
+                       help="two-column profile — reusable in the Single profile tab")
