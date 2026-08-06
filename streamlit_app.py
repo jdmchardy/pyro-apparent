@@ -151,10 +151,12 @@ def _run_sim(file_bytes, name, dt_us, R_um, step_us, bin_us, lo, hi, n_lam):
                 tab, R/sg, float(xi_window(T0g, lo, hi))))
         except Exception:
             pass
+    _tz = getattr(np, "trapezoid", None) or np.trapz
+    E_tot = _tz(spec_bin, lam, axis=0)          # total emission in the window vs time
     return dict(t_fine=t_fine, n_fine=int(t_fine.size), lam=lam, t_bin=t_bin,
                 spec_bin=spec_bin, counts=counts, prof_bin=prof_bin,
                 T_app=T_app, A_app=A_app, T_peak=T_peak, T_gauss=T_gauss,
-                sigma=sigma, T_edge=T_edge, T_app_tab=T_app_tab)
+                sigma=sigma, T_edge=T_edge, T_app_tab=T_app_tab, E_tot=E_tot)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -185,7 +187,9 @@ def _fit_spectra_series(file_bytes, name, lo, hi):
                 guess = T[j]
         except Exception:
             pass
-    return dict(times=times, lam=lam, I=I, mask=m, T_app=T, A_app=A)
+    _tz = getattr(np, "trapezoid", None) or np.trapz
+    E_tot = _tz(np.nan_to_num(I[m]), lam[m], axis=0)   # total emission in the window
+    return dict(times=times, lam=lam, I=I, mask=m, T_app=T, A_app=A, E_tot=E_tot)
 
 
 @st.cache_data(show_spinner=False)
@@ -434,7 +438,8 @@ with tab_sim, tab_body():
 
     st.session_state["sim_result"] = dict(
         t=sim["t_bin"], T_app=sim["T_app"], T_peak=sim["T_peak"],
-        T_gauss=sim["T_gauss"], sigma=sim["sigma"], R_um=R_um, name=str(sname))
+        T_gauss=sim["T_gauss"], sigma=sim["sigma"], R_um=R_um, name=str(sname),
+        E_tot=sim["E_tot"])
 
     m = st.columns(5)
     m[0].metric("interpolated steps", f"{sim['n_fine']}")
@@ -842,7 +847,8 @@ with tab_exp, tab_body():
         st.error(f"could not process this file: {exc}"); raise _SkipTab()
 
     st.session_state["exp_result"] = dict(t=ex["times"], T_app=ex["T_app"],
-                                          A_app=ex["A_app"], name=str(ename))
+                                          A_app=ex["A_app"], name=str(ename),
+                                          E_tot=ex["E_tot"])
     good = np.isfinite(ex["T_app"])
     em = st.columns(5)
     em[0].metric("spectra", f"{ex['I'].shape[1]}")
@@ -872,7 +878,17 @@ with tab_exp, tab_body():
         tr = [dict(x=ex["times"][good], y=ex["A_app"][good], name="fitted amplitude",
                    mode="lines+markers", color="seagreen", width=1.4, size=5)]
         st.plotly_chart(pp.lines(tr, f"time ({elabel})", "fitted amplitude (a.u.)",
-                                 height=380, ylog=True), **PLOTLY)
+                                 height=380), **PLOTLY)
+
+    st.markdown("#### Total emission in the window")
+    Ee = np.asarray(ex["E_tot"], float)
+    tr = [dict(x=ex["times"], y=Ee, name="experimental total emission",
+               mode="lines+markers", color="crimson", width=1.6, size=4)]
+    jpe = int(np.nanargmax(Ee))
+    st.plotly_chart(pp.lines(
+        tr, f"time ({elabel})", "total emission (a.u.)", height=340,
+        vlines=[(ex["times"][jpe], "grey", "dot",
+                 f"peak at {ex['times'][jpe]:g}")]), **PLOTLY)
 
     st.markdown("#### Spectrum inspector")
     je = st.slider("spectrum", 0, ex["I"].shape[1]-1,
@@ -967,3 +983,29 @@ with tab_cmp, tab_body():
                        color="black", width=1.2, size=5)]
             st.plotly_chart(pp.lines(tr, "time", "ΔT (K)", height=280, legend=False,
                                      hlines=[(0, "grey", "dot")]), **PLOTLY)
+
+        # ---- total emission: experiment vs simulation ----
+        Ee = np.asarray(exp_r.get("E_tot", []), float)
+        Es = np.asarray(sim_r.get("E_tot", []), float)
+        if Ee.size and Es.size:
+            st.markdown("#### Total emission vs time")
+            norm = st.checkbox("normalise each to its own peak", value=True,
+                               key="cmp_enorm",
+                               help="absolute intensity is not preserved by the "
+                                    "acquisition, so only the shape is comparable")
+            ee = Ee/np.nanmax(Ee) if (norm and np.nanmax(Ee) > 0) else Ee
+            es = Es/np.nanmax(Es) if (norm and np.nanmax(Es) > 0) else Es
+            jpe, jps = int(np.nanargmax(Ee)), int(np.nanargmax(Es))
+            tr = [dict(x=tsm, y=es, name="simulated total emission",
+                       color="steelblue", width=2.2),
+                  dict(x=te, y=ee, name="experimental total emission",
+                       mode="lines+markers", color="crimson", width=1.6, size=4)]
+            st.plotly_chart(pp.lines(
+                tr, "time", "total emission" + (" (normalised)" if norm else " (a.u.)"),
+                height=380,
+                vlines=[(tsm[jps], "steelblue", "dot", f"sim peak {tsm[jps]:g}"),
+                        (te[jpe], "crimson", "dot", f"exp peak {te[jpe]:g}")]), **PLOTLY)
+            k2 = st.columns(3)
+            k2[0].metric("experimental peak at", f"{te[jpe]:g}")
+            k2[1].metric("simulated peak at", f"{tsm[jps]:g}")
+            k2[2].metric("peak offset (exp − sim)", f"{te[jpe]-tsm[jps]:+.4g}")
