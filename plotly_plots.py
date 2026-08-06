@@ -35,7 +35,7 @@ def _layout(fig, xlab, ylab, title=None, height=400, legend=True, y2lab=None):
         showlegend=legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1,
                     font=dict(size=10), bgcolor="rgba(255,255,255,0.6)"),
-        dragmode="pan",
+        dragmode="zoom",
     )
     fig.update_xaxes(title_text=xlab, **_AXIS)
     fig.update_yaxes(title_text=ylab, **_AXIS)
@@ -177,7 +177,7 @@ def profile_eval(res, fit_lo, fit_hi, t_app_gauss=None, height=420):
     fig.update_xaxes(title_text="λ (µm)", range=[0, 3], row=1, col=2, **_AXIS)
     fig.update_yaxes(title_text="F / F_max", row=1, col=2, **_AXIS)
     fig.update_layout(height=height, margin=dict(l=60, r=20, t=54, b=48),
-                      plot_bgcolor="white", paper_bgcolor="white", dragmode="pan",
+                      plot_bgcolor="white", paper_bgcolor="white", dragmode="zoom",
                       legend=dict(orientation="h", yanchor="top", y=-0.18,
                                   font=dict(size=9)))
     return fig
@@ -251,7 +251,7 @@ def comparison(results, fit_lo, fit_hi, height=760):
         fig.update_xaxes(title_text=xl, row=rr, col=cc, **_AXIS)
         fig.update_yaxes(title_text=yl, row=rr, col=cc, **_AXIS)
     fig.update_layout(height=height, margin=dict(l=60, r=20, t=60, b=60),
-                      plot_bgcolor="white", paper_bgcolor="white", dragmode="pan",
+                      plot_bgcolor="white", paper_bgcolor="white", dragmode="zoom",
                       legend=dict(orientation="h", yanchor="top", y=-0.08,
                                   font=dict(size=9)))
     return fig
