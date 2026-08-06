@@ -183,7 +183,7 @@ st.sidebar.markdown(
     "and its correction via the universal $\\rho(R/\\sigma,\\xi)$ surface.")
 st.sidebar.subheader("Spectrometer window")
 lo_nm = st.sidebar.number_input("window low [nm]", 200.0, 5000.0, 575.0, step=25.0)
-hi_nm = st.sidebar.number_input("window high [nm]", 200.0, 5000.0, 800.0, step=25.0)
+hi_nm = st.sidebar.number_input("window high [nm]", 200.0, 5000.0, 775.0, step=25.0)
 lo, hi = lo_nm * 1e-9, hi_nm * 1e-9
 if lo >= hi:
     st.sidebar.error("window low must be < high")
