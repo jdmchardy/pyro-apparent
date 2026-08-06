@@ -29,6 +29,13 @@ streamlit run streamlit_app.py
   `T(r,t)` map, the collected emission spectra vs time, the fit-geometry/bias evolution,
   and a snapshot explorer showing each profile + Gaussian fit (pinhole shaded) and its
   collected spectrum. Downloadable results.
+- **🔬 Synthetic SOP** — the synthetic streak-optical-pyrometry workflow: annulus-weighted
+  Planck emission through a synthetic pinhole → spectrogram `I(λ, t)`, total emission vs
+  time, **gate-averaged apparent temperature** and **fitted emissivity/amplitude** vs
+  time, `T_peak − T_app`, and per-step spectra with their Planck fits.
+- **📊 Data comparison** — overlay the synthetic SOP on experimental SOP temperatures and
+  integrated emission, with a time delay, optimal intensity scaling, and
+  χ² / reduced χ² / Pearson r / R² statistics.
 - **📈 Single profile** — one snapshot: apparent T, collected spectrum, Gaussian fit, and
   the universal-corrected peak.
 - **🎯 Gaussian & universal** — slider explorer for `(T₀, σ, R)`; apparent T, bias, the
