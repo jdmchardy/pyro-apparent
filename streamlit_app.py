@@ -118,6 +118,40 @@ def _read_xy(file_bytes, name, x_col, y_col, x_scale=1.0):
     return d[:, x_col] * x_scale, d[:, y_col]
 
 
+@st.cache_data(show_spinner=False)
+def fit_shape_3param(lam, I, T_guess=4000.0, ros_guess=1.0, n_max=200):
+    """Fit (amplitude, T_peak, R/sigma) directly to a measured spectrum.
+
+    The collected spectrum is NOT a Planck function -- its departure from one encodes
+    the temperature spread, hence R/sigma. This recovers both T_peak and R/sigma from
+    the spectral SHAPE alone, with no imaging input. It only works below saturation:
+    for R/sigma >~ 1.5 the shape becomes independent of R/sigma (a true degeneracy),
+    so R/sigma runs free there while T_peak stays well determined.
+    """
+    from scipy.optimize import curve_fit
+    lam = np.asarray(lam, float); I = np.asarray(I, float)
+    if lam.size > n_max:                       # subsample: the E1 series is the cost
+        k = np.linspace(0, lam.size - 1, n_max).round().astype(int)
+        lam, I = lam[k], I[k]
+    sig0 = 10e-6                               # nominal; only R/sigma matters
+    scale = np.nanmax(I)
+
+    def model(l, logA, T0, ros):
+        return np.exp(logA) * spectrum(l, T0, sig0, ros * sig0) / scale
+
+    A0 = np.log(max(scale, 1e-300) / max(np.nanmax(
+        spectrum(lam, T_guess, sig0, ros_guess * sig0)), 1e-300)) + np.log(scale)
+    popt, pcov = curve_fit(model, lam, I / scale,
+                           p0=[A0, T_guess, ros_guess],
+                           bounds=([-80, 300, 0.05], [80, 40000, 6.0]), maxfev=20000)
+    err = np.sqrt(np.diag(pcov)) if pcov is not None and np.all(
+        np.isfinite(pcov)) else np.full(3, np.nan)
+    resid = 100 * (model(lam, *popt) / (I / scale) - 1)
+    return dict(T_peak=float(popt[1]), R_over_sigma=float(popt[2]),
+                T_err=float(err[1]), ros_err=float(err[2]),
+                rms_resid=float(np.sqrt(np.nanmean(resid**2))))
+
+
 def gauss_apparent(res, lam_lo, lam_hi):
     """Apparent T under the Gaussian assumption, via the lookup table:
     T0_fit * rho(R/sigma, xi).  Returns None if no Gaussian fit is available."""
@@ -529,10 +563,18 @@ with tab_spec:
     D_um = g0.number_input("pinhole diameter [µm]", 0.1, 1000.0, 30.0, step=1.0,
                            key="sp_D", help="collection aperture; R = D/2")
     R_sp = 0.5 * D_um * 1e-6
-    mode = g1.radio("spot width", ["assume saturated", "known σ"], key="sp_mode",
-                    help="T_app and R alone cannot fix both T_peak and σ — supply σ, "
-                         "or assume the pinhole is saturated (R/σ ≳ 1.5).")
-    if mode == "known σ":
+    mode = g1.radio("spot width", ["assume saturated", "known σ", "fit from shape"],
+                    key="sp_mode",
+                    help="A single T_app cannot fix both T_peak and σ. Supply σ, assume "
+                         "saturation, or fit the spectral SHAPE for both (needs good SNR "
+                         "and an under-filled pinhole).")
+    shape_fit = None
+    if mode == "fit from shape":
+        g2.info("Fitting **(amplitude, $T_{peak}$, $R/\\sigma$)** to the spectrum shape. "
+                "The departure from a pure Planck encodes the temperature spread — no "
+                "imaging needed. Requires SNR ≳ 0.1 % and $R/\\sigma\\lesssim1.5$; above "
+                "saturation the shape stops depending on $R/\\sigma$.")
+    elif mode == "known σ":
         sig_um = g2.number_input("Gaussian σ [µm] (from imaging)", 0.05, 500.0, 10.0,
                                  step=0.5, key="sp_sig")
         ros_sp = R_sp / (sig_um * 1e-6)
@@ -550,7 +592,18 @@ with tab_spec:
     # ---- fit + invert ----
     try:
         T_app_sp, A_sp = fit_temperature(lam_all[m_fit], I_all[m_fit], T_guess=3000.0)
-        T_peak_sp, info = correct_temperature(T_app_sp, ros_sp, lo, hi, return_info=True)
+        if mode == "fit from shape":
+            with st.spinner("fitting the spectral shape…"):
+                shape_fit = fit_shape_3param(lam_all[m_fit], I_all[m_fit],
+                                             T_guess=max(T_app_sp, 500.0))
+            ros_sp = shape_fit["R_over_sigma"]
+            T_peak_sp = shape_fit["T_peak"]
+            sig_um = (R_sp / ros_sp) * 1e6 if ros_sp > 0 else np.nan
+            info = dict(rho=T_app_sp / T_peak_sp if T_peak_sp else np.nan,
+                        xi=float(xi_window(T_peak_sp, lo, hi)))
+        else:
+            T_peak_sp, info = correct_temperature(T_app_sp, ros_sp, lo, hi,
+                                                  return_info=True)
     except Exception as exc:
         st.error(f"fit/inversion failed: {exc}"); st.stop()
 
@@ -561,6 +614,24 @@ with tab_spec:
                 f"{T_peak_sp - T_app_sp:+.0f} K")
     k[3].metric("correction ρ", f"{info['rho']:.3f}")
     k[4].metric("ξ, R/σ", f"{info['xi']:.2f}, {ros_sp:.2f}")
+
+    if shape_fit is not None:
+        s0, s1, s2 = st.columns(3)
+        s0.metric("fitted R/σ", f"{shape_fit['R_over_sigma']:.2f}",
+                  f"± {shape_fit['ros_err']:.2f}" if np.isfinite(shape_fit['ros_err']) else None)
+        s1.metric("implied σ", f"{sig_um:.2f} µm")
+        s2.metric("shape-fit residual", f"{shape_fit['rms_resid']:.3f} %")
+        if shape_fit["R_over_sigma"] > 1.45:
+            st.warning(
+                f"fitted R/σ = {shape_fit['R_over_sigma']:.2f} is at/above saturation — "
+                "there the spectrum shape no longer depends on R/σ, so σ is **not** "
+                "constrained by these data (T_peak above is still reliable). Treat the "
+                "width as an upper bound and prefer imaging, or use a smaller pinhole.")
+        elif shape_fit["rms_resid"] > 0.5:
+            st.warning(
+                f"residual scatter ({shape_fit['rms_resid']:.2f} %) is large compared with "
+                "the shape signature (≲0.3 %), so R/σ is likely noise-dominated. "
+                "T_peak remains far more robust than the width.")
 
     # ---- spectrum + fit ----
     cA, cB = st.columns(2)
