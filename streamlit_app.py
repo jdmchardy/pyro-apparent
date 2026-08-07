@@ -33,6 +33,7 @@ from planck_model import (spectrum, spectrum_from_profile, planck, fit_temperatu
                           load_profile_series, evaluate_profile_series,
                           parse_comsol_line_graph, load_spectra_series,
                           resample_series_time, bin_columns, write_series_csv,
+                          list_excel_sheets, load_spectra_table, calibrate_spectra,
                           get_ratio_table, ratio_from_table, C2)
 import plotly_plots as pp
 
@@ -159,16 +160,50 @@ def _run_sim(file_bytes, name, dt_us, R_um, step_us, bin_us, lo, hi, n_lam):
                 sigma=sigma, T_edge=T_edge, T_app_tab=T_app_tab, E_tot=E_tot)
 
 
+@st.cache_data(show_spinner=False)
+def _sheet_names(file_bytes, name):
+    """Sheet names if the upload is a workbook, else []."""
+    if not name.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        return []
+    suffix = os.path.splitext(name)[1]
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(file_bytes); path = f.name
+    try:
+        return list_excel_sheets(path)
+    finally:
+        os.unlink(path)
+
+
 @st.cache_data(show_spinner=False, max_entries=4)
-def _fit_spectra_series(file_bytes, name, lo, hi):
-    """Fit a Planck (free amplitude + T) to every column of a wide spectra file."""
+def _spectra_arrays(file_bytes, name, sheet, calibrate, sheet_cal,
+                    T_lamp, bin_n, crop_lo, crop_hi):
+    """Load a wide spectra table; optionally build it from raw run + calibration
+    sheets (ratio x lamp Planck, with `bin_n` frames averaged in time)."""
     suffix = os.path.splitext(name)[1] or ".csv"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
         f.write(file_bytes); path = f.name
     try:
-        times, lam, I = load_spectra_series(path)
+        if calibrate:
+            t_run, lam, I_run = load_spectra_table(path, sheet)
+            _, lam_c, I_cal = load_spectra_table(path, sheet_cal)
+            if lam_c.shape != lam.shape or not np.allclose(lam_c, lam):
+                raise ValueError("the run and calibration sheets must share the "
+                                 "wavelength grid")
+            return calibrate_spectra(lam, I_run, I_cal, T_lamp, bin_n=bin_n,
+                                     times=t_run, lam_lo=crop_lo, lam_hi=crop_hi)
+        times, lam, I = load_spectra_table(path, sheet)
+        return times, lam, I
     finally:
         os.unlink(path)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _fit_spectra_series(file_bytes, name, lo, hi, sheet=None, calibrate=False,
+                        sheet_cal=None, T_lamp=2900.0, bin_n=1,
+                        crop_lo=None, crop_hi=None):
+    """Fit a Planck (free amplitude + T) to every column of a wide spectra table."""
+    times, lam, I = _spectra_arrays(file_bytes, name, sheet, calibrate, sheet_cal,
+                                    T_lamp, bin_n, crop_lo, crop_hi)
     m = (lam >= lo) & (lam <= hi)
     if m.sum() < 5:
         raise ValueError(f"only {int(m.sum())} points inside {lo*1e9:.0f}-{hi*1e9:.0f} nm "
@@ -271,7 +306,8 @@ def _find_example(filename):
 def data_source(example_name, label, key):
     """File uploader. Nothing is loaded until the user uploads a file, or explicitly
     opts into the bundled example. Returns (bytes, name) or (None, None)."""
-    up = st.file_uploader(label, type=["csv", "txt", "dat"], key=key)
+    up = st.file_uploader(label, type=["csv", "txt", "dat", "xlsx", "xlsm"],
+                          key=key)
     if up is not None:
         return up.getvalue(), up.name
     path = _find_example(example_name)
@@ -840,11 +876,59 @@ with tab_exp, tab_body():
     with e1:
         elabel = st.text_input("time unit label", "µs", key="exp_u")
 
+    # ---- spreadsheet? offer sheet choice and an optional calibration step ----
+    sheets = _sheet_names(ebytes, ename)
+    sheet = sheet_cal = None
+    calibrate = False
+    T_lamp, bin_n = 2900.0, 1
+    crop_lo = crop_hi = None
+    if sheets:
+        st.caption(f"workbook with {len(sheets)} sheets")
+        mode_c = st.radio("input", ["use a calibrated sheet as-is",
+                                    "calibrate from raw + calibration sheets"],
+                          horizontal=True, key="exp_mode")
+        calibrate = mode_c.startswith("calibrate")
+        if calibrate:
+            q0, q1 = st.columns(2)
+            sheet = q0.selectbox("raw run sheet", sheets, key="exp_sh_run",
+                                 index=min(1, len(sheets)-1))
+            sheet_cal = q1.selectbox("calibration sheet", sheets, key="exp_sh_cal",
+                                     index=min(2, len(sheets)-1))
+            r0, r1, r2, r3 = st.columns(4)
+            T_lamp = r0.number_input("calibration lamp T [K]", 300.0, 10000.0, 2900.0,
+                                     step=50.0, key="exp_tlamp",
+                                     help="known radiance of the calibration source")
+            bin_n = int(r1.number_input("time bin [frames]", 1, 10000, 10, step=1,
+                                        key="exp_binn",
+                                        help="consecutive raw frames averaged per point"))
+            crop_lo = r2.number_input("crop λ low [nm]", 100.0, 5000.0, lo*1e9,
+                                      step=5.0, key="exp_clo") * 1e-9
+            crop_hi = r3.number_input("crop λ high [nm]", 100.0, 5000.0, hi*1e9,
+                                      step=5.0, key="exp_chi") * 1e-9
+            st.caption("calibrated = mean(run over the bin) ÷ calibration × "
+                       "B(λ, lamp T) — the counts ratio removes the instrument "
+                       "response, the Planck factor sets the radiance scale.")
+        else:
+            sheet = st.selectbox("sheet", sheets, key="exp_sh", index=0)
+
     try:
-        with st.spinner("fitting Planck to each spectrum…"):
-            ex = _fit_spectra_series(ebytes, ename, lo, hi)
+        with st.spinner("preparing and fitting spectra…"):
+            ex = _fit_spectra_series(ebytes, ename, lo, hi, sheet=sheet,
+                                     calibrate=calibrate, sheet_cal=sheet_cal,
+                                     T_lamp=T_lamp, bin_n=bin_n,
+                                     crop_lo=crop_lo, crop_hi=crop_hi)
     except Exception as exc:
         st.error(f"could not process this file: {exc}"); raise _SkipTab()
+
+    if calibrate:
+        st.success(f"calibrated {ex['I'].shape[1]} spectra "
+                   f"({bin_n} frames per bin, lamp {T_lamp:.0f} K)")
+        conv = ("# times = " + " ".join(f"{x:g}" for x in ex["times"]) +
+                "\n# wavelength_nm, calibrated intensity per time\n" +
+                "\n".join(",".join(f"{v:.6g}" for v in row)
+                           for row in np.column_stack([ex["lam"]*1e9, ex["I"]])))
+        st.download_button("⬇ download calibrated spectra (CSV)", conv,
+                           "calibrated_spectra.csv", "text/csv")
 
     st.session_state["exp_result"] = dict(t=ex["times"], T_app=ex["T_app"],
                                           A_app=ex["A_app"], name=str(ename),

@@ -385,6 +385,76 @@ def load_spectra_series(path):
     """
     return load_profile_series(path, col0_scale=1e-9)
 
+def list_excel_sheets(path):
+    """Sheet names in an .xlsx/.xls workbook (empty list if it is not a workbook)."""
+    try:
+        import pandas as pd
+        return list(pd.ExcelFile(path).sheet_names)
+    except Exception:
+        return []
+
+
+def load_spectra_table(path, sheet=None):
+    """Read a wide spectra table from CSV/TXT **or** an Excel sheet.
+
+    Layout in both cases: column 0 = wavelength [nm]; row 0 / the '# times =' comment
+    carries the times; the body is intensity. Returns (times, lam [m], I (n_lam, n_t)).
+    """
+    if sheet is not None or str(path).lower().endswith((".xlsx", ".xlsm", ".xls")):
+        import pandas as pd
+        df = pd.read_excel(path, sheet_name=sheet if sheet is not None else 0, header=0)
+        lam = pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy(float)
+        times = pd.to_numeric(pd.Series(df.columns[1:]), errors="coerce").to_numpy(float)
+        I = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+        good = np.isfinite(lam)
+        lam, I = lam[good], I[good]
+        if not np.all(np.isfinite(times)):
+            times = np.arange(I.shape[1], dtype=float)
+        return times, lam * 1e-9, I
+    return load_spectra_series(path)
+
+
+def calibrate_spectra(lam, I_run, I_cal, T_lamp, bin_n=1, times=None,
+                      lam_lo=None, lam_hi=None, cal_time_average=True):
+    """Turn raw shot + calibration spectra into calibrated spectral radiance.
+
+        calibrated = bin(run) / cal  x  B(lambda, T_lamp)
+
+    The counts ratio removes the instrument response; multiplying by the known lamp
+    radiance puts the result on an absolute (arbitrary-constant) radiance scale.
+
+    lam [m] (n_lam,), I_run / I_cal (n_lam, n_t) on the same grid. `bin_n` consecutive
+    time frames of the run are averaged. Returns (times_binned, lam_out, I_out).
+    """
+    lam = np.asarray(lam, float)
+    I_run = np.atleast_2d(np.asarray(I_run, float))
+    I_cal = np.atleast_2d(np.asarray(I_cal, float))
+    if I_cal.shape[0] != lam.size or I_run.shape[0] != lam.size:
+        raise ValueError("run and calibration must share the wavelength grid")
+    times = np.arange(I_run.shape[1], dtype=float) if times is None else np.asarray(times, float)
+
+    m = np.ones(lam.size, bool)
+    if lam_lo is not None:
+        m &= lam >= lam_lo - 1e-15
+    if lam_hi is not None:
+        m &= lam <= lam_hi + 1e-15
+    if m.sum() < 3:
+        raise ValueError("wavelength crop leaves fewer than 3 points")
+
+    bin_n = max(1, int(bin_n))
+    n_bin = I_run.shape[1] // bin_n
+    if n_bin < 1:
+        raise ValueError(f"bin of {bin_n} frames exceeds the {I_run.shape[1]} available")
+    run_b = I_run[m, :n_bin*bin_n].reshape(m.sum(), n_bin, bin_n).mean(axis=2)
+    t_b = times[:n_bin*bin_n].reshape(n_bin, bin_n).mean(axis=1)
+
+    cal = (I_cal[m].mean(axis=1)[:, None] if cal_time_average
+           else I_cal[m, :n_bin*bin_n].reshape(m.sum(), n_bin, bin_n).mean(axis=2))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        resp = np.where(np.abs(cal) > 1e-12, run_b / cal, np.nan)
+    return t_b, lam[m], resp * planck(lam[m], float(T_lamp))[:, None]
+
+
 # ----------------------------------------------------------------- time resampling
 def resample_series_time(times, r, cols, t_new):
     """Interpolate a wide series (r, t) -> (r, t_new), linear with extrapolation.
